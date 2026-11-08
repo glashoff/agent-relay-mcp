@@ -1,0 +1,15 @@
+# systemd user service: ~/.config/systemd/user/agent-relay-mcp.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agent-relay-mcp
+# Logs: journalctl --user -u agent-relay-mcp -f
+[Unit]
+Description=agent-relay-mcp: relay requests to Claude Code in your projects
+
+[Service]
+# Adjust to where it is installed (pipx install puts it into ~/.local/bin).
+ExecStart=%h/.local/bin/agent-relay-mcp
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

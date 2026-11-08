@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-relay-mcp"
+version = "0.1.0"
+description = "MCP server that lets a Claude chat (e.g. the mobile app's voice mode) hand tasks to Claude Code in the dev containers of your projects"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.3,<3"]
+
+[project.urls]
+Homepage = "https://github.com/glashoff/agent-relay-mcp"
+Issues = "https://github.com/glashoff/agent-relay-mcp/issues"
+
+[project.scripts]
+agent-relay-mcp = "agent_relay_mcp.server:main"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_relay_mcp"]

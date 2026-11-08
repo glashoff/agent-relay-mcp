@@ -1,0 +1,26 @@
+# systemd user service for an SSH reverse tunnel to a server with a public
+# TLS reverse proxy (README "Exposing it"): ~/.config/systemd/user/
+#   systemctl --user enable agent-relay-tunnel
+# It is tied to agent-relay-mcp.service: starting or stopping that one starts
+# or stops the tunnel too, so there is one switch for both.
+#
+# Replace RELAY_USER@RELAY_HOST, and 127.0.0.1:8765 on the server side if the
+# proxy runs in a container and needs another address (a bridge IP, with
+# "GatewayPorts clientspecified" for this user in the server's sshd_config).
+# The key should be good for nothing else; on the server, restrict it:
+#   restrict,port-forwarding,permitlisten="127.0.0.1:8765" ssh-ed25519 AAAA...
+[Unit]
+Description=SSH reverse tunnel for agent-relay-mcp
+BindsTo=agent-relay-mcp.service
+After=agent-relay-mcp.service network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -T \
+    -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o BatchMode=yes -o IdentitiesOnly=yes -i %h/.ssh/agent-relay-tunnel \
+    -R 127.0.0.1:8765:127.0.0.1:8765 RELAY_USER@RELAY_HOST
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=agent-relay-mcp.service
