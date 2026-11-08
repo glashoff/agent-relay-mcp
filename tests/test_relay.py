@@ -237,3 +237,16 @@ def test_a_restart_with_the_container_stopped(setup, monkeypatch):
         assert "Done: quick (new)" in await restarted.get_updates("alpha", 0)
         await relay.stop("delta")
     run(scenario())
+
+
+def test_a_failed_turn_after_a_restart_still_resumes(setup):
+    config, _ = setup
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "crash", False, 8)   # the session was created
+        session = relay.conversations["alpha"].session_id
+        restarted = Relay(config)
+        assert "(resumed)" in await restarted.send_message("alpha", "next", False, 8)
+        assert restarted.conversations["alpha"].session_id == session
+    run(scenario())

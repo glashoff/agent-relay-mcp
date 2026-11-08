@@ -43,6 +43,7 @@ class Turn:
     error: str = ""
     delivered: bool = False
     resumed: bool = False      # continued an existing session rather than starting one
+    born: bool = False         # Claude Code reported the session, so it exists
     output: TurnOutput = field(default_factory=TurnOutput)
     offset: int = 0            # bytes of out.jsonl already fed to output
     # The output is not stored in state.json. After a restart it is read again
@@ -52,7 +53,7 @@ class Turn:
     def to_state(self) -> dict:
         return {"id": self.id, "message": self.message, "started": self.started,
                 "phase": self.phase, "error": self.error, "delivered": self.delivered,
-                "resumed": self.resumed}
+                "resumed": self.resumed, "born": self.born}
 
 
 @dataclass
@@ -163,6 +164,7 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null
             turn.output.feed(line)
         turn.offset += used
         turn.output_loaded = True
+        turn.born = turn.born or bool(turn.output.session_id)
         if status == "RUNNING":
             turn.phase = RUNNING
         elif status.startswith("EXIT") or status == "GONE":
@@ -293,7 +295,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             # A new conversation whose first run failed may never have been
             # created; resuming it would fail too.
             unborn = (previous is not None and previous.phase == FAILED and not previous.resumed
-                      and not previous.output.session_id)
+                      and not previous.born)
             resume = bool(conversation.session_id) and not new_conversation and not unborn
             if not resume:
                 conversation.session_id = str(uuid.uuid4())
