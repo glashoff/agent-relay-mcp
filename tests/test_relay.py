@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_relay_mcp import targets
 from agent_relay_mcp.config import Config
 from agent_relay_mcp.relay import Relay
 from agent_relay_mcp.targets import RelayError
@@ -40,6 +41,18 @@ async def until_done(relay, project, seconds=10):
             return report
         await asyncio.sleep(0.25)
     raise AssertionError("never finished: " + report)
+
+
+async def until_finished(relay, project, seconds=10):
+    """Waits for a run to end without picking up its reply."""
+    for _ in range(seconds * 4):
+        turn = relay.conversations[project].turn
+        await relay._refresh(targets.find_project(relay.config, project),
+                             relay.conversations[project])
+        if turn.phase not in ("starting", "running"):
+            return
+        await asyncio.sleep(0.25)
+    raise AssertionError(f"{project} never finished")
 
 
 def test_list_projects_skips_hidden(setup):
@@ -153,3 +166,74 @@ def test_unknown_project_lists_the_real_ones(setup):
     config, _ = setup
     with pytest.raises(RelayError, match="alpha"):
         run(Relay(config).send_message("gamma", "hi", False, 0))
+
+
+def listed(listing, name):
+    return next(line for line in listing.splitlines() if line.startswith(f"- {name} "))
+
+
+def test_a_restart_keeps_finished_turns_finished(setup):
+    config, projects = setup
+    (projects / "delta").mkdir()
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "quick", False, 8)       # reply reported
+        await relay.send_message("Beta", "quick", False, 0)        # reply not picked up
+        await until_finished(relay, "Beta")
+        await relay.send_message("delta", "sleep 3", False, 0)     # still running
+        await asyncio.sleep(0.5)
+
+        restarted = Relay(config)
+        listing = await restarted.list_projects()
+        assert listed(listing, "alpha").endswith("host)")
+        assert "a reply is waiting" in listed(listing, "Beta")
+        assert "Claude Code is working" in listed(listing, "delta")
+
+        assert "already reported" in await restarted.get_updates("alpha", 0)
+        report = await restarted.get_updates("Beta", 0)
+        assert "finished" in report and "Done: quick (new)" in report
+        assert "a reply is waiting" not in listed(await restarted.list_projects(), "Beta")
+
+        # list_projects notices on its own that the running one has ended.
+        for _ in range(40):
+            if "a reply is waiting" in listed(await restarted.list_projects(), "delta"):
+                break
+            await asyncio.sleep(0.25)
+        else:
+            raise AssertionError("delta never finished")
+        assert "Done: sleep 3 (new)" in await restarted.get_updates("delta", 0)
+    run(scenario())
+
+
+def test_a_restart_with_the_container_stopped(setup, monkeypatch):
+    config, projects = setup
+    (projects / "delta").mkdir()
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "quick", False, 0)       # reply not picked up
+        await until_finished(relay, "alpha")
+        await relay.send_message("delta", "sleep 30", False, 0)    # running
+        await asyncio.sleep(0.5)
+
+        # The containers stop with the server down.
+        real_target_for = targets.target_for
+        monkeypatch.setattr(targets, "target_for",
+                            lambda config, project, *, start: None if not start
+                            else real_target_for(config, project, start=start))
+        restarted = Relay(config)
+        listing = await restarted.list_projects()
+        assert "a reply is waiting" in listed(listing, "alpha")
+        assert "working" not in listed(listing, "delta")
+        assert "not running any more" in await restarted.get_updates("delta", 0)
+
+        report = await restarted.get_updates("alpha", 0)
+        assert "not running now" in report and "failed" not in report
+        assert "a reply is waiting" in listed(await restarted.list_projects(), "alpha")
+
+        # Once the container runs again, the reply is there.
+        monkeypatch.setattr(targets, "target_for", real_target_for)
+        assert "Done: quick (new)" in await restarted.get_updates("alpha", 0)
+        await relay.stop("delta")
+    run(scenario())

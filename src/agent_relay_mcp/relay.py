@@ -45,6 +45,9 @@ class Turn:
     resumed: bool = False      # continued an existing session rather than starting one
     output: TurnOutput = field(default_factory=TurnOutput)
     offset: int = 0            # bytes of out.jsonl already fed to output
+    # The output is not stored in state.json. After a restart it is read again
+    # from the run, but only when needed: a reply not yet reported.
+    output_loaded: bool = True
 
     def to_state(self) -> dict:
         return {"id": self.id, "message": self.message, "started": self.started,
@@ -86,10 +89,10 @@ class Relay:
             turn = entry.get("turn")
             conversation = Conversation(entry.get("session_id", ""))
             if turn:
-                conversation.turn = Turn(**turn)
-                if conversation.turn.phase in (STARTING, FINISHED):
-                    # The output is not stored here but read again from the run:
-                    # polling finds it finished (or gone) and fills in the reply.
+                conversation.turn = Turn(**turn, output_loaded=False)
+                if conversation.turn.phase == STARTING:
+                    # The launch was cut off by the restart; the run may or may
+                    # not exist. Polling finds it running, finished or missing.
                     conversation.turn.phase = RUNNING
             self.conversations[name] = conversation
 
@@ -159,6 +162,7 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null
         for line in lines:
             turn.output.feed(line)
         turn.offset += used
+        turn.output_loaded = True
         if status == "RUNNING":
             turn.phase = RUNNING
         elif status.startswith("EXIT") or status == "GONE":
@@ -207,6 +211,31 @@ kill -KILL -- "-$p" 2>/dev/null || true
         if turn.phase != RUNNING:
             self._save()
 
+    async def _load_output(self, project: Project, turn: Turn) -> bool:
+        """Reads the reply of a finished turn again from its run, after a restart.
+        False if the dev container is not running, so it cannot be read now."""
+        target = await asyncio.to_thread(targets.target_for, self.config, project, start=False)
+        if target is None:
+            return False
+        await asyncio.to_thread(self._poll, target, turn)
+        if turn.phase != FINISHED:      # the run is gone, or left no reply
+            self._save()
+        return True
+
+    async def _check(self, project: Project) -> None:
+        """For list_projects: whether a turn that is running still is. Skipped
+        while another call works on the project; that one keeps it current."""
+        conversation = self.conversations.get(project.name)
+        turn = conversation.turn if conversation else None
+        lock = self._lock(project.name)
+        if not turn or turn.phase != RUNNING or lock.locked():
+            return
+        async with lock:
+            try:
+                await self._refresh(project, conversation)
+            except RelayError as error:
+                log.warning("checking %s failed: %s", project.name, error)
+
     async def _wait(self, project: Project, conversation: Conversation, seconds: int) -> None:
         deadline = time.monotonic() + max(0, min(seconds, self.config.max_wait_seconds))
         while True:
@@ -224,7 +253,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             running = await asyncio.to_thread(targets.running_folders, self.config)
         except RelayError:
             running = set()
-        lines = []
+        listed = []
         for project in projects:
             if project.has_devcontainer:
                 where = "dev container" + (", running" if project.path in running else "")
@@ -232,6 +261,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 where = "no dev container, runs on the host"
             else:
                 continue
+            listed.append((project, where))
+        await asyncio.gather(*(self._check(project) for project, _ in listed))
+        lines = []
+        for project, where in listed:
             conversation = self.conversations.get(project.name)
             turn = conversation.turn if conversation else None
             if turn and turn.phase in (STARTING, RUNNING):
@@ -313,6 +346,15 @@ kill -KILL -- "-$p" 2>/dev/null || true
             conversation = self.conversations.get(project.name)
             if not conversation or not conversation.turn:
                 return f"Nothing has been sent to Claude Code in {project.name} yet."
+            turn = conversation.turn
+            if turn.phase == FINISHED and not turn.output_loaded:
+                if turn.delivered:
+                    return (f"Claude Code in {project.name} finished the last request, and "
+                            "its reply was already reported. It is not kept here any more.")
+                if not await self._load_output(project, turn):
+                    return (f"Claude Code in {project.name} finished the last request, but its "
+                            "reply is in the project's dev container, which is not running "
+                            "now. Start the container to read the reply.")
             if wait_seconds > 0:
                 deadline = time.monotonic() + min(wait_seconds, self.config.max_wait_seconds)
                 while conversation.turn.phase == STARTING and time.monotonic() < deadline:
