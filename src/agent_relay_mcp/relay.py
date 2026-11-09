@@ -1050,6 +1050,54 @@ kill -KILL -- "-$p" 2>/dev/null || true
                         self._queue_to_request(project, conversation, now)
         return stopped
 
+    async def release_access(self, project_name: str, all_projects: bool) -> str:
+        """For the chat: ends grants when the user is done. It only takes access
+        away, so it is a tool; it refuses while anything is still to be done
+        there, so nothing the user asked for is cut off."""
+        self._background()
+        now = self.clock()
+        if all_projects:
+            grants = [g for g in self.access.grants.values() if self.access.live(g, now)]
+            if not grants:
+                return "Nothing is approved; every project is already locked."
+            projects = [p for p in await asyncio.to_thread(targets.list_projects, self.config)
+                        if any(g.target == p.name or (g.target == ALL and (
+                            natural(p) == CONTAINER or g.include_host_projects))
+                            for g in grants)]
+        else:
+            if not project_name.strip():
+                raise RelayError("Name a project, or release all projects.")
+            project = targets.find_project(self.config, project_name)
+            projects = [project]
+            grants = [g for g in self.access.grants.values()
+                      if g.target == project.name and self.access.live(g, now)]
+            if not grants:
+                if self.access.covering(project.name, natural(project), now):
+                    return (f"{project.name} is approved only through the approval for all "
+                            "projects. Ending that locks every project; call release_access "
+                            "with all_projects to do so.")
+                return f"{project.name} is not approved; it is already locked."
+        busy = []
+        for project in projects:
+            async with self._lock(project.name):
+                await self._refresh_all(project)
+                if self._busy_kind(project) or project.name in self.access.switches:
+                    busy.append(project.name)
+        if busy:
+            raise RelayError(
+                f"Not released: Claude Code is still working in {', '.join(busy)}, or has "
+                "messages waiting there. Release it once it has finished, or stop it first.")
+        for grant in grants:
+            if grant.id in self.access.grants:
+                self.access.end(grant.id)
+                self._emit("grant_ended", grant=grant.id, reason="released by the chat",
+                           stopped=False)
+        self.access.save()
+        log.info("released %d grant(s) on request of the chat", len(grants))
+        if all_projects:
+            return "Released all approvals. Every project is locked again."
+        return f"Released the approval for {projects[0].name}. It is locked again."
+
     async def cancel_switch(self, project_name: str) -> None:
         project = self._project(project_name)
         async with self._lock(project.name):

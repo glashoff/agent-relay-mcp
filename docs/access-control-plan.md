@@ -55,6 +55,11 @@ that it can run there later without GNOME.
     runs, without the lid inhibitor (the lid checkbox is off).
 11. **The menu and the notifications are in English**, like the rest of the
     relay.
+12. **The chat may end approvals**: the MCP tool `release_access` ends the
+    grant for a project, or all grants, when the user says they are done. It
+    only takes access away, so it is acceptable as a tool; it is refused,
+    with a clear message, while a request runs or messages wait there.
+    Giving approvals stays at the laptop only.
 
 ## 2. Threat model
 
@@ -100,8 +105,9 @@ that it can run there later without GNOME.
   over SSH. Not built now.
 - **`agent-relay-ctl`**: command line for state, grants, revoke, deny and
   keep-awake, over D-Bus.
-- **Nothing of this is reachable over HTTP or as an MCP tool.** The MCP
-  endpoint has no way to grant or approve.
+- **Nothing that grants is reachable over HTTP or as an MCP tool.** The MCP
+  endpoint has no way to grant or approve; its only access tool,
+  `release_access`, ends grants (decision 12).
 
 ## 4. Core: grants and requests
 

@@ -325,6 +325,8 @@ def test_no_tool_can_choose_the_host():
         parameters = set(inspect.signature(getattr(Relay, name)).parameters)
         assert parameters <= {"self", "project_name", "message", "new_conversation",
                               "wait_seconds"}, name
+    assert set(inspect.signature(Relay.release_access).parameters) == \
+        {"self", "project_name", "all_projects"}
 
 
 def test_a_switch_waits_until_the_other_kind_is_idle(setup):
@@ -386,6 +388,71 @@ def test_approving_on_the_host_while_the_container_works_waits(setup):
         assert result["switch"]["kind"] == HOST and not relay.access.requests
         assert relay.access.switches["web"].held == ["next"]
         await relay.stop("web")
+    run(scenario())
+
+
+# --- released by the chat -----------------------------------------------------------
+
+def test_the_chat_can_release_a_project_when_nothing_runs(setup):
+    async def scenario():
+        relay = Relay(setup)
+        events = relay.subscribe()
+        await Control(relay).grant("web")
+        await relay.send_message("web", "quick", False, 8)
+        answer = await relay.release_access("web", False)
+        assert "locked again" in answer and not relay.access.grants
+        assert "locked" in await relay.send_message("web", "more", False, 0)
+        kinds = []
+        while not events.empty():
+            kinds.append(events.get_nowait())
+        assert any(e["type"] == "grant_ended" and e["reason"] == "released by the chat"
+                   for e in kinds)
+        assert "already locked" in await relay.release_access("web", False)
+    run(scenario())
+
+
+def test_releasing_is_refused_while_claude_code_works_or_messages_wait(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await Control(relay).grant("web")
+        await relay.send_message("web", "sleep 30", False, 0)
+        await until_running(relay, "web")
+        with pytest.raises(targets.RelayError, match="still working in web"):
+            await relay.release_access("web", False)
+        with pytest.raises(targets.RelayError, match="still working in web"):
+            await relay.release_access("", True)
+        assert relay.access.grants
+        await relay.stop("web")
+        relay.conversations["web"].queue.append("waiting")      # a message waits
+        with pytest.raises(targets.RelayError, match="messages waiting"):
+            await relay.release_access("web", False)
+        relay.conversations["web"].queue.clear()
+        assert "locked again" in await relay.release_access("web", False)
+    run(scenario())
+
+
+def test_releasing_all_and_the_grant_for_all_projects(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        await control.grant(ALL)
+        await control.grant("alpha", full_access_ok=True)
+        answer = await relay.release_access("web", False)
+        assert "only through the approval for all projects" in answer
+        assert len(relay.access.grants) == 2
+        assert "Every project is locked again" in await relay.release_access("", True)
+        assert not relay.access.grants
+        assert "already locked" in await relay.release_access("", True)
+    run(scenario())
+
+
+def test_releasing_never_grants(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await relay.release_access("web", False)
+        await relay.release_access("", True)
+        assert not relay.access.grants
+        assert "locked" in await relay.send_message("web", "hi", False, 0)
     run(scenario())
 
 

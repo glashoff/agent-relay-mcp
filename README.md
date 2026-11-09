@@ -20,7 +20,7 @@ phone (Claude app) ── Anthropic ──HTTPS──> your reverse proxy /<secr
 
 ## What the chat gets
 
-Four tools:
+Five tools:
 
 | Tool | What it does |
 |---|---|
@@ -28,6 +28,7 @@ Four tools:
 | `send_message(project, message, new_conversation=false, wait_seconds=0)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. While Claude Code works, the message is passed into the running request, or queued as the next one. Returns at once, unless `wait_seconds` is set |
 | `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps), or the final reply |
 | `stop(project)` | Ends the current request; the conversation is kept |
+| `release_access(project="", all_projects=false)` | Ends your approval for a project (or all) when you say you are done, so it is locked again; refused while Claude Code still works there. It can only take access away |
 
 Requests to a coding agent take minutes, but Claude's apps give up on a tool
 call after somewhere between 20 and 60 seconds. So nothing here waits by

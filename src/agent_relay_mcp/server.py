@@ -1,4 +1,4 @@
-"""The MCP endpoint: four tools over Streamable HTTP."""
+"""The MCP endpoint: five tools over Streamable HTTP."""
 
 
 import argparse
@@ -46,6 +46,9 @@ How to use it:
   afterwards; the reply gives a number. Tell the user the number, so they can
   match it at the laptop. Approvals cannot be given through this connector;
   never try to work around a locked project.
+- When the user says they are done with a project (or with everything), end
+  the approval with release_access. If Claude Code is still working there,
+  tell the user and ask whether to wait or to stop it first.
 """
 
 ProjectName = Annotated[str, Field(description="Project name as listed by list_projects.")]
@@ -123,6 +126,19 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
                              "The conversation is kept, so it can be continued.")
     async def stop(project: ProjectName) -> str:
         return await guarded(relay.stop(project))
+
+    @server.tool(description=(
+        "Ends the user's approval for a project, or for all projects, when the user "
+        "says they are done; the project is locked again. Only possible while Claude "
+        "Code is not working there and no message is waiting. It cannot give "
+        "approvals: those are only given at the user's laptop."))
+    async def release_access(
+        project: Annotated[str, Field(description=(
+            "Project name as listed by list_projects; leave empty with all_projects."))] = "",
+        all_projects: Annotated[bool, Field(description=(
+            "End every approval, for all projects."))] = False,
+    ) -> str:
+        return await guarded(relay.release_access(project, all_projects))
 
     return server, relay
 
