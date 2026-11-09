@@ -10,6 +10,7 @@ import pytest
 
 from agent_relay_mcp import relay as relay_module
 from agent_relay_mcp import targets
+from agent_relay_mcp.access import ALL
 from agent_relay_mcp.config import Config
 from agent_relay_mcp.relay import Relay
 from agent_relay_mcp.targets import RelayError
@@ -18,7 +19,7 @@ FAKE = Path(__file__).with_name("fake_claude.py")
 
 
 @pytest.fixture
-def setup(tmp_path, monkeypatch):
+def locked(tmp_path, monkeypatch):
     # Runs keep their files under $HOME/.cache; keep them in the test's directory.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     projects = tmp_path / "projects"
@@ -28,6 +29,15 @@ def setup(tmp_path, monkeypatch):
     config = Config(projects_dir=projects, allow_host_projects=True,
                     claude_command=f"{sys.executable} {FAKE}",
                     state_dir=tmp_path / "state", max_wait_seconds=10)
+    return config, projects
+
+
+@pytest.fixture
+def setup(locked):
+    """Projects approved for the test, as given at the laptop; the grant is
+    stored, so every Relay made from config sees it."""
+    config, projects = locked
+    run(Relay(config).grant(ALL, include_host_projects=True, full_access_ok=True))
     return config, projects
 
 
@@ -289,7 +299,8 @@ def test_a_restart_keeps_finished_turns_finished(setup):
 
         restarted = Relay(config)
         listing = await restarted.list_projects()
-        assert listed(listing, "alpha").endswith("host)")
+        alpha = listed(listing, "alpha")
+        assert "working" not in alpha and "reply is waiting" not in alpha
         assert "a reply is waiting" in listed(listing, "Beta")
         assert "Claude Code is working" in listed(listing, "delta")
 
@@ -323,8 +334,9 @@ def test_a_restart_with_the_container_stopped(setup, monkeypatch):
         # The containers stop with the server down.
         real_target_for = targets.target_for
         monkeypatch.setattr(targets, "target_for",
-                            lambda config, project, *, start: None if not start
-                            else real_target_for(config, project, start=start))
+                            lambda config, project, *, start, on_host=False: None
+                            if not start else real_target_for(config, project, start=start,
+                                                              on_host=on_host))
         restarted = Relay(config)
         listing = await restarted.list_projects()
         assert "a reply is waiting" in listed(listing, "alpha")

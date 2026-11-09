@@ -39,3 +39,19 @@ extra_args = []
 # Longest wait a tool call may ask for, in seconds. Claude's apps give up on a
 # tool call somewhere between 20 and 60 seconds.
 max_wait_seconds = 15
+
+# What this instance is called in the tool texts, e.g. "Laptop"; empty: not
+# mentioned.
+instance_name = ""
+
+# Approvals. Every project is locked; a message to it waits for approval at
+# the laptop. A grant ends after grant_idle_minutes without a message or a
+# running request; an unanswered request is dropped after
+# request_expiry_minutes. Upper limits per grant: one project, all projects,
+# and anything with full access to this computer (projects without a dev
+# container, or a project run on the host instead of its dev container).
+grant_idle_minutes = 30
+request_expiry_minutes = 30
+max_grant_hours = 12
+max_all_grant_hours = 4
+max_host_grant_hours = 2

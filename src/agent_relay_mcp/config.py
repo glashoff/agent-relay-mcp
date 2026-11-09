@@ -56,6 +56,20 @@ class Config:
     max_wait_seconds: int = 15
     state_dir: Path = DEFAULT_STATE_DIR
 
+    # What this instance is called in the tool texts, e.g. "Laptop"; empty:
+    # not mentioned.
+    instance_name: str = ""
+    # Grants and requests (see access.py). A grant ends after this long
+    # without a message or a running request; a request nobody answers is
+    # dropped after request_expiry_minutes. Upper limits per grant: for one
+    # project, for all projects, and for anything with full access (host
+    # projects, a project run on the host).
+    grant_idle_minutes: int = 30
+    request_expiry_minutes: int = 30
+    max_grant_hours: int = 12
+    max_all_grant_hours: int = 4
+    max_host_grant_hours: int = 2
+
 
 def load(path: Path | None = None) -> Config:
     path = path or DEFAULT_CONFIG_FILE
@@ -84,4 +98,8 @@ def load(path: Path | None = None) -> Config:
         raise SystemExit(f"{path}: path must start with /")
     if not 0 <= config.max_wait_seconds <= 60:
         raise SystemExit(f"{path}: max_wait_seconds must be between 0 and 60")
+    for key in ("grant_idle_minutes", "request_expiry_minutes", "max_grant_hours",
+                "max_all_grant_hours", "max_host_grant_hours"):
+        if getattr(config, key) < 1:
+            raise SystemExit(f"{path}: {key} must be at least 1")
     return config

@@ -39,6 +39,11 @@ How to use it:
   offer details. Quote Claude Code's reply verbatim only when asked.
 - Questions Claude Code asks in its reply go to the user; pass the user's
   answer back with send_message.
+- Projects are locked unless the user has approved them at their laptop. A
+  message to a locked project waits for that approval and runs by itself
+  afterwards; the reply gives a number. Tell the user the number, so they can
+  match it at the laptop. Approvals cannot be given through this connector;
+  never try to work around a locked project.
 """
 
 ProjectName = Annotated[str, Field(description="Project name as listed by list_projects.")]
@@ -46,7 +51,11 @@ ProjectName = Annotated[str, Field(description="Project name as listed by list_p
 
 def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
     relay = Relay(config)
-    server = MCPServer("agent-relay-mcp", instructions=INSTRUCTIONS, version="0.1.0")
+    instructions = INSTRUCTIONS
+    if config.instance_name:
+        instructions += (f"\nThis connector works on the user's {config.instance_name}; its "
+                         "projects are the ones there.\n")
+    server = MCPServer("agent-relay-mcp", instructions=instructions, version="0.1.0")
     max_wait = config.max_wait_seconds
 
     async def guarded(call):

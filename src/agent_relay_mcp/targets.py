@@ -126,13 +126,15 @@ def _container_details(config: Config, container_id: str, project: Project) -> t
     return user, workdir
 
 
-def target_for(config: Config, project: Project, *, start: bool) -> Target | None:
+def target_for(config: Config, project: Project, *, start: bool,
+               on_host: bool = False) -> Target | None:
     """Where Claude Code runs for project; None if its container is not running
-    and start is off."""
-    if not project.has_devcontainer:
+    and start is off. on_host: on this machine even if it has a dev container
+    (only ever set from a grant, see access.py)."""
+    if on_host or not project.has_devcontainer:
         if not config.allow_host_projects:
-            raise RelayError(f"{project.name} has no dev container, and running "
-                             "Claude Code outside one is turned off.")
+            raise RelayError(f"{project.name} cannot run on this machine: running "
+                             "Claude Code outside a dev container is turned off.")
         return Target(project, None, None, str(project.path))
     container_id = running_container(config, project)
     if not container_id:

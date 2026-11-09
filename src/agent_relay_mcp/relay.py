@@ -11,6 +11,15 @@ its next step. A small shell loop next to the run closes the FIFO once a result
 has come after the last message passed in, so the run ends. Messages that
 cannot be passed in (the run is still being started, or is already ending) are
 queued here and sent as the next request once the run has ended.
+
+Nothing runs without a grant (access.py). A message to a project no grant
+covers becomes a request that waits for approval at the laptop; grants and
+approvals only come through the control layer (control.py), never through an
+MCP tool. A project with a dev container runs on the host only under a grant of
+the kind "host"; it then has a conversation of its own there (key
+"<name>/host"), since Claude Code keeps its sessions per machine and folder.
+Only one kind of a project is ever busy: a switch waits until the other kind
+has nothing left to do.
 """
 
 from __future__ import annotations
@@ -21,10 +30,11 @@ import logging
 import shlex
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
-from pathlib import Path
+from dataclasses import dataclass, field
 
 from . import targets
+from .access import (ALL, CONTAINER, HOST, HOST_WARNING, ON_HOST_WARNING, Access,
+                     AccessError, Grant, Limits, Switch)
 from .config import Config
 from .events import TurnOutput, complete_lines
 from .targets import Project, RelayError, Target
@@ -32,6 +42,7 @@ from .targets import Project, RelayError, Target
 log = logging.getLogger("agent_relay_mcp")
 
 QUEUE_POLL_SECONDS = 2
+SWEEP_SECONDS = 10         # how often grants, requests and switches are checked
 
 RUN_ROOT = '"$HOME/.cache/agent-relay-mcp"'
 KEEP_RUNS_DAYS = 7
@@ -74,6 +85,11 @@ class Conversation:
     session_id: str = ""
     turn: Turn | None = None
     queue: list[str] = field(default_factory=list)  # sent as the next request
+    on_host: bool = False      # runs on this machine, not in a dev container
+
+    @property
+    def busy(self) -> bool:
+        return bool(self.queue) or bool(self.turn and self.turn.phase in (STARTING, RUNNING))
 
 
 # Runs next to Claude Code, as its parent: feeds it the first message through
@@ -117,6 +133,28 @@ def _run_dir(turn_id: str) -> str:
     return f'{RUN_ROOT}/{turn_id}'
 
 
+def natural(project: Project) -> str:
+    """Where a project runs unless a grant says otherwise."""
+    return CONTAINER if project.has_devcontainer else HOST
+
+
+def _key(project: Project, kind: str) -> str:
+    """The conversation of project when it runs as kind. A project name never
+    contains "/"."""
+    return project.name if kind == natural(project) else f"{project.name}/{kind}"
+
+
+def _where(kind: str) -> str:
+    return "on the host" if kind == HOST else "in the dev container"
+
+
+def _duration(seconds: float) -> str:
+    minutes = max(0, int(seconds // 60))
+    if minutes >= 60:
+        return f"{minutes // 60} h {minutes % 60} min"
+    return f"{minutes} min"
+
+
 class Relay:
     def __init__(self, config: Config):
         self.config = config
@@ -125,6 +163,15 @@ class Relay:
         self.locks: dict[str, asyncio.Lock] = {}
         self.background: set[asyncio.Task] = set()
         self.watchers: dict[str, asyncio.Task] = {}
+        self.sweeper: asyncio.Task | None = None
+        self.subscribers: set[asyncio.Queue] = set()
+        self.clock = time.time
+        self.access = Access(config.state_dir / "access.json", Limits(
+            idle=config.grant_idle_minutes * 60,
+            request_expiry=config.request_expiry_minutes * 60,
+            max_project=config.max_grant_hours * 3600,
+            max_all=config.max_all_grant_hours * 3600,
+            max_host=config.max_host_grant_hours * 3600))
         self._load()
 
     # --- persistence -------------------------------------------------------
@@ -140,7 +187,8 @@ class Relay:
         for name, entry in raw.items():
             turn = entry.get("turn")
             conversation = Conversation(entry.get("session_id", ""),
-                                        queue=entry.get("queue") or [])
+                                        queue=entry.get("queue") or [],
+                                        on_host=entry.get("on_host", False))
             if turn:
                 conversation.turn = Turn(**turn, output_loaded=False)
                 if conversation.turn.phase == STARTING:
@@ -153,14 +201,89 @@ class Relay:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         data = {name: {"session_id": c.session_id,
                        "turn": c.turn.to_state() if c.turn else None,
-                       "queue": c.queue}
+                       "queue": c.queue, "on_host": c.on_host}
                 for name, c in self.conversations.items()}
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self.state_file)
 
     def _lock(self, name: str) -> asyncio.Lock:
-        return self.locks.setdefault(name, asyncio.Lock())
+        """One lock per project, for both of its conversations."""
+        return self.locks.setdefault(name.split("/")[0], asyncio.Lock())
+
+    # --- events, for the control layer ---------------------------------------
+
+    def subscribe(self) -> asyncio.Queue:
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self.subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self.subscribers.discard(queue)
+
+    def _emit(self, event_type: str, **data) -> None:
+        log.info("event %s %s", event_type,
+                 {k: v for k, v in data.items() if k != "message"})
+        event = {"type": event_type, "time": self.clock(), **data}
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                self.subscribers.discard(queue)
+
+    # --- conversations and where they run -------------------------------------
+
+    def _conversation(self, project: Project, kind: str) -> Conversation:
+        key = _key(project, kind)
+        conversation = self.conversations.get(key)
+        if conversation is None:
+            conversation = self.conversations[key] = Conversation(on_host=kind == HOST)
+        return conversation
+
+    def _project_conversations(self, project: Project) -> list[tuple[str, Conversation]]:
+        """(kind, conversation) for the kinds project has conversations in."""
+        found = []
+        for kind in (CONTAINER, HOST):
+            conversation = self.conversations.get(_key(project, kind))
+            if conversation is not None:
+                found.append((kind, conversation))
+        return found
+
+    def _busy_kind(self, project: Project) -> str | None:
+        return next((kind for kind, c in self._project_conversations(project) if c.busy),
+                    None)
+
+    def _current(self, project: Project) -> tuple[str, Conversation] | None:
+        """The conversation to report on: the busy one, else the latest."""
+        found = self._project_conversations(project)
+        busy = [(k, c) for k, c in found if c.busy]
+        if busy:
+            return busy[0]
+        with_turn = [(k, c) for k, c in found if c.turn]
+        if with_turn:
+            return max(with_turn, key=lambda kc: kc[1].turn.started)
+        return found[0] if found else None
+
+    def _route(self, project: Project, now: float) -> tuple[str, Grant | None, str]:
+        """Where a new message for project goes: ("go", grant, kind), ("hold",
+        None, kind) while a switch waits, or ("locked", None, "")."""
+        switch = self.access.switches.get(project.name)
+        if switch:
+            return "hold", None, switch.kind
+        grant = self.access.covering(project.name, natural(project), now)
+        if not grant:
+            return "locked", None, ""
+        kind = grant.kind if grant.target != ALL else natural(project)
+        busy = self._busy_kind(project)
+        if busy and busy != kind:
+            # The grant now covers the other kind, but this one still works:
+            # the change waits until it is idle, as any switch does.
+            self.access.switches[project.name] = Switch(
+                project.name, kind, now, now + self.access.limits.request_expiry, None)
+            self.access.save()
+            self._emit("switch_pending", project=project.name, kind=kind)
+            return "hold", None, kind
+        return "go", grant, kind
 
     # --- the run in the container -----------------------------------------
 
@@ -275,13 +398,18 @@ kill -KILL -- "-$p" 2>/dev/null || true
 """
         targets.run_in(self.config, target, script)
 
+    def _target(self, project: Project, conversation: Conversation, *,
+                start: bool) -> Target | None:
+        return targets.target_for(self.config, project, start=start,
+                                  on_host=conversation.on_host)
+
     # --- refreshing ---------------------------------------------------------
 
     async def _refresh(self, project: Project, conversation: Conversation) -> None:
         turn = conversation.turn
         if not turn or turn.phase not in (RUNNING,):
             return
-        target = await asyncio.to_thread(targets.target_for, self.config, project, start=False)
+        target = await asyncio.to_thread(self._target, project, conversation, start=False)
         if target is None:
             turn.phase = FAILED
             turn.error = "The project's dev container is not running any more."
@@ -291,11 +419,22 @@ kill -KILL -- "-$p" 2>/dev/null || true
             conversation.session_id = turn.output.session_id
         if turn.phase != RUNNING:
             self._save()
+            self._emit("run_ended", project=project.name,
+                       kind=self._kind_of(project, conversation), phase=turn.phase)
 
-    async def _load_output(self, project: Project, turn: Turn) -> bool:
+    async def _refresh_all(self, project: Project) -> None:
+        for _, conversation in self._project_conversations(project):
+            await self._refresh(project, conversation)
+
+    @staticmethod
+    def _kind_of(project: Project, conversation: Conversation) -> str:
+        return HOST if conversation.on_host or not project.has_devcontainer else CONTAINER
+
+    async def _load_output(self, project: Project, conversation: Conversation) -> bool:
         """Reads the reply of a finished turn again from its run, after a restart.
         False if the dev container is not running, so it cannot be read now."""
-        target = await asyncio.to_thread(targets.target_for, self.config, project, start=False)
+        turn = conversation.turn
+        target = await asyncio.to_thread(self._target, project, conversation, start=False)
         if target is None:
             return False
         await asyncio.to_thread(self._poll, target, turn)
@@ -306,14 +445,15 @@ kill -KILL -- "-$p" 2>/dev/null || true
     async def _check(self, project: Project) -> None:
         """For list_projects: whether a turn that is running still is. Skipped
         while another call works on the project; that one keeps it current."""
-        conversation = self.conversations.get(project.name)
-        turn = conversation.turn if conversation else None
         lock = self._lock(project.name)
-        if not turn or turn.phase != RUNNING or lock.locked():
+        running = [c for _, c in self._project_conversations(project)
+                   if c.turn and c.turn.phase == RUNNING]
+        if not running or lock.locked():
             return
         async with lock:
             try:
-                await self._refresh(project, conversation)
+                for conversation in running:
+                    await self._refresh(project, conversation)
             except RelayError as error:
                 log.warning("checking %s failed: %s", project.name, error)
 
@@ -328,8 +468,31 @@ kill -KILL -- "-$p" 2>/dev/null || true
 
     # --- the tools ------------------------------------------------------------
 
+    def _access_note(self, project: Project, now: float) -> str:
+        """The access state of project for list_projects."""
+        request = self.access.open_request(project.name)
+        if request:
+            return f"locked, waiting for approval (number {request.number})"
+        switch = self.access.switches.get(project.name)
+        if switch:
+            return f"switching to run {_where(switch.kind)} once idle"
+        grant = self.access.covering(project.name, natural(project), now)
+        if not grant:
+            note = "locked"
+        else:
+            left = min(grant.expires - now, grant.idle - (now - grant.last_used))
+            note = f"approved for {_duration(left)}"
+            kind = grant.kind if grant.target != ALL else natural(project)
+            if kind == HOST and project.has_devcontainer:
+                note += ", on the host: full access"
+        return note
+
+    def _instance(self) -> str:
+        return f" on the {self.config.instance_name}" if self.config.instance_name else ""
+
     async def list_projects(self) -> str:
-        self._watch_queues()
+        self._background()
+        now = self.clock()
         projects = await asyncio.to_thread(targets.list_projects, self.config)
         try:
             running = await asyncio.to_thread(targets.running_folders, self.config)
@@ -340,14 +503,15 @@ kill -KILL -- "-$p" 2>/dev/null || true
             if project.has_devcontainer:
                 where = "dev container" + (", running" if project.path in running else "")
             elif self.config.allow_host_projects:
-                where = "no dev container, runs on the host"
+                where = "no dev container: runs on the host, with full access to the computer"
             else:
                 continue
             listed.append((project, where))
         await asyncio.gather(*(self._check(project) for project, _ in listed))
         lines = []
         for project, where in listed:
-            conversation = self.conversations.get(project.name)
+            current = self._current(project)
+            conversation = current[1] if current else None
             turn = conversation.turn if conversation else None
             if turn and turn.phase in (STARTING, RUNNING):
                 where += "; Claude Code is working"
@@ -355,8 +519,11 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 where += "; a reply is waiting"
             if conversation and conversation.queue:
                 where += f"; {len(conversation.queue)} message(s) queued"
-            lines.append(f"- {project.name} ({where})")
-        return "Projects:\n" + "\n".join(lines) if lines else "No usable projects found."
+            lines.append(f"- {project.name} ({where}; {self._access_note(project, now)})")
+        if not lines:
+            return "No usable projects found."
+        return (f"Projects{self._instance()} (every project is locked unless approved at "
+                "the laptop):\n" + "\n".join(lines))
 
     async def send_message(self, project_name: str, message: str,
                            new_conversation: bool, wait_seconds: int) -> str:
@@ -367,9 +534,26 @@ kill -KILL -- "-$p" 2>/dev/null || true
         if not project.has_devcontainer and not self.config.allow_host_projects:
             raise RelayError(f"{project.name} has no dev container, and running "
                              "Claude Code outside one is turned off.")
-        self._watch_queues()
+        self._background()
         async with self._lock(project.name):
-            conversation = self.conversations.setdefault(project.name, Conversation())
+            await self._refresh_all(project)
+            now = self.clock()
+            route, grant, kind = self._route(project, now)
+            if route == "locked":
+                return self._ask(project, [message], now)
+            if route == "hold":
+                switch = self.access.switches[project.name]
+                switch.held.append(message)
+                self.access.save()
+                log.info("send_message %s: %d characters, held for a switch",
+                         project.name, len(message))
+                return (f"{project.name} is switching to run {_where(kind)}; that waits "
+                        "until the request still working on the other side has finished. "
+                        "The message is held and runs there once the switch is done. Ask "
+                        "for the result later with get_updates.")
+            self.access.touch(grant, now)
+            self.access.save()
+            conversation = self._conversation(project, kind)
             await self._refresh(project, conversation)
             if conversation.turn and conversation.turn.phase in (STARTING, RUNNING):
                 if new_conversation:
@@ -378,10 +562,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
                                      "a stop.")
                 return await self._add_to_running(project, conversation, message, wait_seconds)
             turn, resume = self._begin(project, conversation, message, new_conversation)
-            container_running = (not project.has_devcontainer) or bool(
+            container_running = conversation.on_host or bool(
                 await asyncio.to_thread(targets.running_container, self.config, project))
-            log.info("send_message %s: %d characters, %s", project.name, len(message),
-                     "resume" if resume else "new conversation")
+            log.info("send_message %s: %d characters, %s, %s", project.name, len(message),
+                     "resume" if resume else "new conversation", kind)
 
             if wait_seconds > 0:
                 deadline = time.monotonic() + min(wait_seconds, self.config.max_wait_seconds)
@@ -391,13 +575,38 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 if turn.phase == RUNNING and remaining > 0:
                     await self._wait(project, conversation, remaining)
             if turn.phase in (FINISHED, FAILED):
-                return self._report(project, turn, mark_delivered=True)
+                return self._report(project, conversation, mark_delivered=True)
 
         what = "Continuing the existing conversation" if resume else "Started a new conversation"
+        if kind == HOST and project.has_devcontainer:
+            what += " on the host (not in the dev container, as approved at the laptop)"
         start_note = "" if container_running else \
             " The dev container is being started first, which can take a minute or two."
         return (f"{what} with Claude Code in {project.name}. It is working on it."
                 f"{start_note} Ask for the result later with get_updates.")
+
+    def _ask(self, project: Project, messages: list[str], now: float) -> str:
+        """Turns messages for a project no grant covers into a request."""
+        try:
+            request, new = self.access.request(project.name, messages, now,
+                                               full_access=not project.has_devcontainer)
+        except AccessError as error:
+            raise RelayError(str(error)) from error
+        self.access.save()
+        self._emit("request_added" if new else "request_updated", project=project.name,
+                   request=request.id, number=request.number,
+                   full_access=request.full_access)
+        log.info("%s: %d message(s) wait for approval (number %d)", project.name,
+                 len(messages), request.number)
+        warning = (f" {project.name} has no dev container, so the approval at the laptop "
+                   "warns that it runs with full access to the computer."
+                   if request.full_access else "")
+        added = "" if new else " The message was added to the request already waiting."
+        return (f"{project.name} is locked{self._instance()}. The message waits for approval "
+                f"at the laptop: number {request.number}. Tell the user this number, so they "
+                "can match it there. Once approved, it runs automatically; ask with "
+                f"get_updates. The request expires in "
+                f"{_duration(request.expires - now)} if nobody answers it.{added}{warning}")
 
     def _begin(self, project: Project, conversation: Conversation, message: str,
                new_conversation: bool, earlier_reply: str = "") -> tuple[Turn, bool]:
@@ -415,6 +624,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     earlier_reply=earlier_reply)
         conversation.turn = turn
         self._save()
+        self._emit("run_started", project=project.name,
+                   kind=self._kind_of(project, conversation),
+                   full_access=self._kind_of(project, conversation) == HOST,
+                   message=message[:300])
         task = asyncio.create_task(
             self._start(project, conversation, turn, conversation.session_id, resume))
         self.background.add(task)
@@ -428,8 +641,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
         turn = conversation.turn
         # Queued messages go first, so the order stays as sent.
         if turn.phase == RUNNING and not turn.closed and not conversation.queue:
-            target = await asyncio.to_thread(targets.target_for, self.config, project,
-                                             start=False)
+            target = await asyncio.to_thread(self._target, project, conversation, start=False)
             if target and await asyncio.to_thread(self._pass_in, target, turn, message):
                 turn.passed_in.append(message)
                 self._save()
@@ -439,13 +651,13 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     await self._wait(project, conversation, wait_seconds)
                     if turn.phase in (FINISHED, FAILED):
                         return ("Passed the message into the running request. "
-                                + self._report(project, turn, mark_delivered=True))
+                                + self._report(project, conversation, mark_delivered=True))
                 return (f"Passed the message directly into the request Claude Code in "
                         f"{project.name} is working on; it takes it into account at its "
                         "next step. Ask for the result later with get_updates.")
         conversation.queue.append(message)
         self._save()
-        self._watch(project.name)
+        self._watch(_key(project, self._kind_of(project, conversation)))
         log.info("send_message %s: %d characters, queued", project.name, len(message))
         if turn.phase == STARTING:
             why = ("Claude Code is still being started, so the message cannot be passed "
@@ -461,33 +673,60 @@ kill -KILL -- "-$p" 2>/dev/null || true
 
     # --- the queue ------------------------------------------------------------
 
-    def _watch(self, name: str) -> None:
-        """Makes sure something takes care of name's queue."""
-        if name not in self.watchers:
-            task = asyncio.create_task(self._drain(name))
-            self.watchers[name] = task
-            task.add_done_callback(lambda _: self.watchers.pop(name, None))
+    def _watch(self, key: str) -> None:
+        """Makes sure something takes care of the queue of conversation key."""
+        if key not in self.watchers:
+            task = asyncio.create_task(self._drain(key))
+            self.watchers[key] = task
+            task.add_done_callback(lambda _: self.watchers.pop(key, None))
 
-    def _watch_queues(self) -> None:
-        """Takes up queues left by a restart."""
-        for name, conversation in self.conversations.items():
+    def _background(self) -> None:
+        """Takes up queues left by a restart, and keeps the sweeper going."""
+        for key, conversation in self.conversations.items():
             if conversation.queue:
-                self._watch(name)
+                self._watch(key)
+        if self.sweeper is None or self.sweeper.done():
+            self.sweeper = asyncio.create_task(self._sweep_forever())
 
-    async def _drain(self, name: str) -> None:
+    def _may_run(self, project: Project, conversation: Conversation, now: float) -> bool:
+        """Whether a grant still covers conversation's kind of project."""
+        grant = self.access.covering(project.name, natural(project), now)
+        if not grant:
+            return False
+        kind = grant.kind if grant.target != ALL else natural(project)
+        return kind == self._kind_of(project, conversation)
+
+    def _queue_to_request(self, project: Project, conversation: Conversation,
+                          now: float) -> None:
+        """Queued messages no grant covers any more wait for approval again."""
+        if not conversation.queue:
+            return
+        messages, conversation.queue = conversation.queue, []
+        self._save()
+        try:
+            self._ask(project, messages, now)
+        except RelayError as error:
+            log.warning("%s: dropped %d queued message(s): %s", project.name,
+                        len(messages), error)
+
+    async def _drain(self, key: str) -> None:
         """Passes the queue into the run once it can take messages, or sends it
         as the next request once the run has ended."""
+        name = key.split("/")[0]
         while True:
             await asyncio.sleep(QUEUE_POLL_SECONDS)
             try:
                 project = targets.find_project(self.config, name)
             except RelayError as error:     # the project is gone
-                log.warning("dropping the queue of %s: %s", name, error)
+                log.warning("dropping the queue of %s: %s", key, error)
                 return
             try:
                 async with self._lock(name):
-                    conversation = self.conversations.get(name)
+                    conversation = self.conversations.get(key)
                     if not conversation or not conversation.queue:
+                        return
+                    if not self._may_run(project, conversation, self.clock()):
+                        self._queue_to_request(project, conversation, self.clock())
                         return
                     turn = conversation.turn
                     if turn and turn.phase == STARTING:
@@ -498,34 +737,35 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     if turn and turn.phase == RUNNING:
                         if turn.closed:
                             continue
-                        target = await asyncio.to_thread(targets.target_for, self.config,
-                                                         project, start=False)
+                        target = await asyncio.to_thread(self._target, project, conversation,
+                                                         start=False)
                         if target and await asyncio.to_thread(self._pass_in, target, turn,
                                                               message):
                             turn.passed_in += conversation.queue
                             conversation.queue = []
                             self._save()
-                            log.info("%s: passed the queue into the running request", name)
+                            log.info("%s: passed the queue into the running request", key)
                             return
                         continue
                     conversation.queue = []
-                    earlier = await self._unreported(project, turn) if turn else ""
+                    earlier = await self._unreported(project, conversation) if turn else ""
                     self._begin(project, conversation, message, False, earlier)
-                    log.info("%s: sent the queue as the next request", name)
+                    log.info("%s: sent the queue as the next request", key)
                     return
             except RelayError as error:
-                log.warning("handling the queue of %s failed: %s", name, error)
+                log.warning("handling the queue of %s failed: %s", key, error)
             except Exception:
-                log.exception("handling the queue of %s failed", name)
+                log.exception("handling the queue of %s failed", key)
 
-    async def _unreported(self, project: Project, turn: Turn) -> str:
+    async def _unreported(self, project: Project, conversation: Conversation) -> str:
         """What the chat has not heard yet about an ended turn."""
+        turn = conversation.turn
         if turn.delivered:
             return ""
         turn.delivered = True
         text = turn.earlier_reply + "\n\n" if turn.earlier_reply else ""
         if turn.phase == FINISHED and not turn.output_loaded \
-                and not await self._load_output(project, turn):
+                and not await self._load_output(project, conversation):
             return text + "(Its reply could not be read: the dev container was not running.)"
         if turn.phase == FAILED:
             return text + f"It failed: {turn.error}"
@@ -534,7 +774,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
     async def _start(self, project: Project, conversation: Conversation, turn: Turn,
                      session_id: str, resume: bool) -> None:
         try:
-            target = await asyncio.to_thread(targets.target_for, self.config, project, start=True)
+            target = await asyncio.to_thread(self._target, project, conversation, start=True)
             await asyncio.to_thread(self._launch, target, turn, session_id, resume)
             turn.phase = RUNNING
         except RelayError as error:
@@ -548,20 +788,31 @@ kill -KILL -- "-$p" 2>/dev/null || true
 
     async def get_updates(self, project_name: str, wait_seconds: int) -> str:
         project = targets.find_project(self.config, project_name)
-        self._watch_queues()
+        self._background()
         async with self._lock(project.name):
-            conversation = self.conversations.get(project.name)
-            if not conversation or not conversation.turn:
-                return f"Nothing has been sent to Claude Code in {project.name} yet."
-            turn = conversation.turn
+            now = self.clock()
+            current = self._current(project)
+            conversation = current[1] if current else None
+            turn = conversation.turn if conversation else None
+            waiting = self._waiting_note(project, turn, now)
+            if not turn and conversation and conversation.queue:
+                return (f"Claude Code in {project.name} is being started with "
+                        f"{len(conversation.queue)} approved message(s).")
+            if not turn:
+                return waiting or f"Nothing has been sent to Claude Code in {project.name} yet."
+            if waiting and turn.delivered and not conversation.busy:
+                return waiting
+            prefix = waiting + "\n\n" if waiting else ""
             if turn.phase == FINISHED and not turn.output_loaded:
                 if turn.delivered:
-                    return (f"Claude Code in {project.name} finished the last request, and "
-                            "its reply was already reported. It is not kept here any more.")
-                if not await self._load_output(project, turn):
-                    return (f"Claude Code in {project.name} finished the last request, but its "
-                            "reply is in the project's dev container, which is not running "
-                            "now. Start the container to read the reply.")
+                    return prefix + (f"Claude Code in {project.name} finished the last request, "
+                                     "and its reply was already reported. It is not kept here "
+                                     "any more.")
+                if not await self._load_output(project, conversation):
+                    return prefix + (f"Claude Code in {project.name} finished the last "
+                                     "request, but its reply is in the project's dev "
+                                     "container, which is not running now. Start the "
+                                     "container to read the reply.")
             if wait_seconds > 0:
                 deadline = time.monotonic() + min(wait_seconds, self.config.max_wait_seconds)
                 while conversation.turn.phase == STARTING and time.monotonic() < deadline:
@@ -569,19 +820,52 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 await self._wait(project, conversation, int(deadline - time.monotonic()))
             else:
                 await self._refresh(project, conversation)
-            return self._report(project, conversation.turn, mark_delivered=True)
+            return prefix + self._report(project, conversation, mark_delivered=True)
+
+    def _waiting_note(self, project: Project, turn: Turn | None, now: float) -> str:
+        """What get_updates says about a request or switch of project, if any."""
+        request = self.access.open_request(project.name)
+        if request:
+            return (f"The request to {project.name} is waiting for approval at the laptop "
+                    f"(number {request.number}, {_duration(now - request.created)} so far; "
+                    f"it expires in {_duration(request.expires - now)}).")
+        switch = self.access.switches.get(project.name)
+        if switch and switch.held:
+            return (f"{len(switch.held)} message(s) to {project.name} are held until it has "
+                    f"switched to run {_where(switch.kind)}.")
+        outcome = self.access.outcomes.get(project.name)
+        if outcome and (not turn or outcome.time > turn.started):
+            if outcome.status == "denied":
+                return (f"The request to {project.name} (number {outcome.number}) was "
+                        "denied at the laptop. Nothing was run.")
+            return (f"The request to {project.name} (number {outcome.number}) expired "
+                    "without an answer at the laptop. Nothing was run.")
+        return ""
 
     async def stop(self, project_name: str) -> str:
         project = targets.find_project(self.config, project_name)
         async with self._lock(project.name):
-            conversation = self.conversations.get(project.name)
-            turn = conversation.turn if conversation else None
-            if not turn or turn.phase not in (STARTING, RUNNING):
+            working = [c for _, c in self._project_conversations(project)
+                       if c.turn and c.turn.phase in (STARTING, RUNNING)]
+            if not working:
                 return f"Claude Code is not working in {project.name}."
+            conversation = working[0]
+            turn = conversation.turn
             if turn.phase == STARTING:
                 return ("The dev container is still starting; stop again in a moment, "
                         "once Claude Code runs.")
-            target = await asyncio.to_thread(targets.target_for, self.config, project, start=False)
+            dropped = await self._stop_conversation(project, conversation)
+        log.info("stop %s", project.name)
+        note = f" {dropped} queued message{'s were' if dropped > 1 else ' was'} dropped." \
+            if dropped else ""
+        return f"Stopped Claude Code in {project.name}. The conversation is kept.{note}"
+
+    async def _stop_conversation(self, project: Project, conversation: Conversation) -> int:
+        """Stops the running turn of conversation and drops its queue; the
+        number of messages dropped. The caller holds the project's lock."""
+        turn = conversation.turn
+        if turn and turn.phase == RUNNING:
+            target = await asyncio.to_thread(self._target, project, conversation, start=False)
             if target:
                 await asyncio.to_thread(self._stop, target, turn)
                 await asyncio.to_thread(self._poll, target, turn)
@@ -589,13 +873,317 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 turn.phase = FAILED
                 turn.error = "Stopped on request."
             turn.delivered = True
-            dropped = len(conversation.queue)
-            conversation.queue = []
-            self._save()
-        log.info("stop %s", project.name)
-        note = f" {dropped} queued message{'s were' if dropped > 1 else ' was'} dropped." \
-            if dropped else ""
-        return f"Stopped Claude Code in {project.name}. The conversation is kept.{note}"
+        dropped = len(conversation.queue)
+        conversation.queue = []
+        self._save()
+        return dropped
+
+    # --- grants, requests and switches (for the control layer) ----------------
+
+    def _project(self, name: str) -> Project:
+        """A project by its exact name, as the control layer names them."""
+        project = targets.find_project(self.config, name)
+        if project.name != name:
+            raise AccessError(f"There is no project named {name!r}.")
+        return project
+
+    def _check_kind(self, project: Project | None, kind: str, include_host_projects: bool,
+                    full_access_ok: bool) -> None:
+        if project and natural(project) == HOST and kind != HOST:
+            raise AccessError(f"{project.name} has no dev container; it can only run on "
+                              "the host.")
+        full = kind == HOST or include_host_projects
+        if full and not self.config.allow_host_projects:
+            raise AccessError("Running Claude Code outside a dev container is turned off "
+                              "(allow_host_projects).")
+        if full and not full_access_ok:
+            warning = ON_HOST_WARNING if project and project.has_devcontainer else HOST_WARNING
+            raise AccessError(f"Needs confirmation: {warning}")
+
+    async def grant(self, target: str, kind: str | None = None, seconds: int = 3600, *,
+                    end_on_lock: bool | None = None, include_host_projects: bool = False,
+                    full_access_ok: bool = False, when_idle: bool = False) -> dict:
+        """Gives a grant. For a project whose other kind is still busy, it is
+        refused unless when_idle, in which case it waits as a switch."""
+        self._background()
+        now = self.clock()
+        if target == ALL:
+            if kind not in (None, CONTAINER):
+                raise AccessError("A grant for all projects runs them in their dev "
+                                  "containers; a project runs on the host only by a grant "
+                                  "of its own.")
+            self._check_kind(None, CONTAINER, include_host_projects, full_access_ok)
+            grant = self.access.add_grant(ALL, CONTAINER, seconds, now, natural=CONTAINER,
+                                          end_on_lock=end_on_lock,
+                                          include_host_projects=include_host_projects)
+            self.access.save()
+            self._emit("grant_added", grant=grant.id, target=ALL,
+                       full_access=grant.full_access)
+            return {"grant": self._grant_info(grant, now, seconds)}
+        project = self._project(target)
+        kind = kind or natural(project)
+        self._check_kind(project, kind, False, full_access_ok)
+        params = {"target": project.name, "kind": kind, "seconds": seconds,
+                  "end_on_lock": end_on_lock}
+        async with self._lock(project.name):
+            await self._refresh_all(project)
+            busy = self._busy_kind(project)
+            if busy and busy != kind:
+                return self._switch(project, kind, params, when_idle, [], now)
+            grant = self._add_grant(project, params, now)
+            return {"grant": self._grant_info(grant, now, seconds)}
+
+    def _add_grant(self, project: Project, params: dict, now: float) -> Grant:
+        grant = self.access.add_grant(params["target"], params["kind"], params["seconds"],
+                                      now, natural=natural(project),
+                                      end_on_lock=params["end_on_lock"])
+        self.access.switches.pop(project.name, None)
+        self.access.save()
+        self._emit("grant_added", grant=grant.id, target=project.name, kind=grant.kind,
+                    full_access=grant.full_access or natural(project) == HOST)
+        return grant
+
+    def _switch(self, project: Project, kind: str, params: dict | None, when_idle: bool,
+                held: list[str], now: float) -> dict:
+        other = self._busy_kind(project)
+        conversation = self.conversations[_key(project, other)]
+        turn = conversation.turn
+        parts = []
+        if turn and turn.phase in (STARTING, RUNNING):
+            parts.append(f"is still working on a request ({_duration(now - turn.started)} "
+                         "so far)")
+        if conversation.queue:
+            parts.append(f"has {len(conversation.queue)} queued message(s)")
+        busy = (f"Switching {project.name} to run {_where(kind)}: {_where(other)} it "
+                + " and ".join(parts) + ".")
+        if not when_idle:
+            raise AccessError(busy + " Switch when it is idle, or revoke and stop it first.")
+        self.access.switches[project.name] = Switch(
+            project.name, kind, now, now + self.access.limits.request_expiry, params,
+            list(held))
+        self.access.save()
+        self._emit("switch_pending", project=project.name, kind=kind)
+        return {"switch": {"project": project.name, "kind": kind, "waiting_for": busy}}
+
+    async def approve(self, request_id: str, kind: str | None = None, seconds: int = 3600, *,
+                      end_on_lock: bool | None = None, full_access_ok: bool = False,
+                      when_idle: bool = False) -> dict:
+        """Approves an open request with a grant for its project; its messages
+        then run as if they had just been sent."""
+        self._background()
+        request = self.access.requests.get(request_id)
+        if not request:
+            raise AccessError(f"There is no open request {request_id}; it may have "
+                              "expired or been answered already.")
+        project = self._project(request.project)
+        kind = kind or natural(project)
+        self._check_kind(project, kind, False, full_access_ok)
+        params = {"target": project.name, "kind": kind, "seconds": seconds,
+                  "end_on_lock": end_on_lock}
+        async with self._lock(project.name):
+            now = self.clock()
+            await self._refresh_all(project)
+            busy = self._busy_kind(project)
+            if busy and busy != kind:
+                result = self._switch(project, kind, params, when_idle, request.messages, now)
+                self.access.take_request(request_id)
+                self.access.save()
+                self._emit("request_answered", request=request_id, project=project.name,
+                           approved=True)
+                return result
+            self.access.take_request(request_id)
+            grant = self._add_grant(project, params, now)
+            self._emit("request_answered", request=request_id, project=project.name,
+                       approved=True)
+            self._enqueue(project, kind, request.messages)
+            return {"grant": self._grant_info(grant, now, seconds)}
+
+    def _enqueue(self, project: Project, kind: str, messages: list[str]) -> None:
+        """Hands approved messages to the queue of project's conversation as kind,
+        which passes them in or sends them as the next request."""
+        if not messages:
+            return
+        conversation = self._conversation(project, kind)
+        conversation.queue += messages
+        self._save()
+        self._watch(_key(project, kind))
+
+    async def deny(self, request_id: str) -> None:
+        request = self.access.deny(request_id, self.clock())
+        self.access.save()
+        self._emit("request_answered", request=request_id, project=request.project,
+                   approved=False)
+
+    async def revoke(self, grant_id: str, stop: bool = False) -> dict:
+        """Ends a grant. Running requests finish unless stop; queued messages
+        wait for approval again (or are dropped, with stop)."""
+        grant = self.access.end(grant_id)
+        self.access.save()
+        self._emit("grant_ended", grant=grant_id, reason="revoked", stopped=stop)
+        stopped = await self._after_grant_end(grant, stop)
+        return {"revoked": grant_id, "stopped": stopped}
+
+    async def _after_grant_end(self, grant: Grant, stop: bool) -> int:
+        """Applies the end of grant to the conversations it covered; the number
+        of requests stopped."""
+        now = self.clock()
+        stopped = 0
+        for project in await asyncio.to_thread(targets.list_projects, self.config):
+            if grant.target not in (ALL, project.name):
+                continue
+            async with self._lock(project.name):
+                for kind, conversation in self._project_conversations(project):
+                    if self._may_run(project, conversation, now):
+                        continue        # another grant still covers it
+                    if stop:
+                        working = conversation.turn and conversation.turn.phase == RUNNING
+                        await self._stop_conversation(project, conversation)
+                        stopped += bool(working)
+                        switch = self.access.switches.pop(project.name, None)
+                        if switch:
+                            self.access.save()
+                    else:
+                        self._queue_to_request(project, conversation, now)
+        return stopped
+
+    async def cancel_switch(self, project_name: str) -> None:
+        project = self._project(project_name)
+        async with self._lock(project.name):
+            switch = self.access.switches.pop(project.name, None)
+            if not switch:
+                raise AccessError(f"No switch is waiting for {project.name}.")
+            self.access.save()
+            self._emit("switch_cancelled", project=project.name)
+            if switch.held:
+                self._ask(project, switch.held, self.clock())
+
+    async def screen_locked(self) -> None:
+        for grant in self.access.screen_locked():
+            self.access.save()
+            self._emit("grant_ended", grant=grant.id, reason="screen locked", stopped=False)
+            await self._after_grant_end(grant, False)
+
+    # --- the sweeper ------------------------------------------------------------
+
+    async def _sweep_forever(self) -> None:
+        while True:
+            await asyncio.sleep(SWEEP_SECONDS)
+            try:
+                await self.sweep()
+            except Exception:
+                log.exception("checking grants failed")
+
+    async def sweep(self) -> None:
+        """Ends grants that ran out, drops expired requests, and carries out
+        switches whose other side has become idle."""
+        projects = {p.name: p for p in await asyncio.to_thread(targets.list_projects,
+                                                                self.config)}
+        for project in projects.values():
+            if any(c.turn and c.turn.phase == RUNNING
+                   for _, c in self._project_conversations(project)):
+                await self._check(project)
+        now = self.clock()
+        # A running request is use: it keeps the grants that cover it alive.
+        for project in projects.values():
+            if self._busy_kind(project):
+                grant = self.access.covering(project.name, natural(project), now,
+                                             idle_ok=True)
+                if grant:
+                    self.access.touch(grant, now)
+        for grant in self.access.ended(now):
+            reason = "expired" if now >= grant.expires else "idle"
+            self.access.save()
+            self._emit("grant_ended", grant=grant.id, reason=reason, stopped=False)
+            await self._after_grant_end(grant, False)
+        for request in self.access.expired_requests(now):
+            self.access.save()
+            self._emit("request_expired", request=request.id, project=request.project)
+        for name, switch in list(self.access.switches.items()):
+            project = projects.get(name)
+            if project:
+                await self._advance_switch(project, switch)
+        self.access.save()
+
+    async def _advance_switch(self, project: Project, switch: Switch) -> None:
+        async with self._lock(project.name):
+            now = self.clock()
+            if self.access.switches.get(project.name) is not switch:
+                return
+            busy = self._busy_kind(project)
+            if busy and busy != switch.kind:
+                if now >= switch.expires:
+                    del self.access.switches[project.name]
+                    self.access.save()
+                    self._emit("switch_expired", project=project.name, kind=switch.kind)
+                    if switch.held:
+                        self._ask(project, switch.held, now)
+                return
+            del self.access.switches[project.name]
+            if switch.grant:
+                self._add_grant(project, switch.grant, now)
+            self.access.save()
+            self._emit("switch_done", project=project.name, kind=switch.kind)
+            if switch.held:
+                route, _, kind = self._route(project, now)
+                if route == "go" and kind == switch.kind:
+                    self._enqueue(project, kind, switch.held)
+                else:
+                    self._ask(project, switch.held, now)
+
+    # --- state, for the control layer -------------------------------------------
+
+    def _grant_info(self, grant: Grant, now: float, asked: int | None = None) -> dict:
+        """A grant for the control layer. asked: the duration asked for, to say
+        whether it was cut to the upper limit."""
+        return {"id": grant.id, "target": grant.target, "kind": grant.kind,
+                "cut_to_limit": asked is not None and grant.expires - grant.created < asked,
+                "expires": grant.expires,
+                "idle_ends": grant.last_used + grant.idle,
+                "seconds_left": max(0, int(min(grant.expires,
+                                               grant.last_used + grant.idle) - now)),
+                "end_on_lock": grant.end_on_lock,
+                "include_host_projects": grant.include_host_projects,
+                "full_access": grant.full_access or self._is_host_project(grant.target)}
+
+    def _is_host_project(self, name: str) -> bool:
+        if name == ALL:
+            return False
+        try:
+            return natural(targets.find_project(self.config, name)) == HOST
+        except RelayError:
+            return False
+
+    def state(self) -> dict:
+        """Everything the GNOME menu or agent-relay-ctl shows."""
+        now = self.clock()
+        projects = []
+        for project in targets.list_projects(self.config):
+            if not project.has_devcontainer and not self.config.allow_host_projects:
+                continue
+            grant = self.access.covering(project.name, natural(project), now)
+            busy = self._busy_kind(project)
+            projects.append({
+                "name": project.name, "dev_container": project.has_devcontainer,
+                "grant": grant.id if grant else None,
+                "kind": (grant.kind if grant.target != ALL else natural(project))
+                if grant else None,
+                "busy": busy})
+        return {
+            "instance": self.config.instance_name,
+            "allow_host": self.config.allow_host_projects,
+            "projects": projects,
+            "grants": [self._grant_info(g, now) for g in self.access.grants.values()
+                       if self.access.live(g, now)],
+            "requests": [{"id": r.id, "project": r.project, "number": r.number,
+                          "messages": [m[:2000] for m in r.messages],
+                          "created": r.created, "expires": r.expires,
+                          "full_access": r.full_access}
+                         for r in self.access.requests.values()],
+            "switches": [{"project": s.project, "kind": s.kind, "requested": s.requested,
+                          "expires": s.expires, "held": len(s.held)}
+                         for s in self.access.switches.values()],
+            "warnings": {"host_project": HOST_WARNING, "on_host": ON_HOST_WARNING},
+        }
 
     # --- reporting ------------------------------------------------------------
 
@@ -606,7 +1194,9 @@ kill -KILL -- "-$p" 2>/dev/null || true
             return "Final replies, in order:\n" + "\n\n---\n\n".join(out.results)
         return f"Final reply:\n{out.result}"
 
-    def _report(self, project: Project, turn: Turn, *, mark_delivered: bool) -> str:
+    def _report(self, project: Project, conversation: Conversation, *,
+                mark_delivered: bool) -> str:
+        turn = conversation.turn
         elapsed = int(time.time() - turn.started)
         took = f"{elapsed // 60} min {elapsed % 60} s" if elapsed >= 60 else f"{elapsed} s"
         out = turn.output
@@ -618,8 +1208,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                    f"{turn.earlier_reply}\n\n") if turn.earlier_reply else ""
         passed = (f"\n{len(turn.passed_in)} message(s) were passed into this request "
                   "while it worked.") if turn.passed_in else ""
-        conversation = self.conversations.get(project.name)
-        queued = len(conversation.queue) if conversation else 0
+        queued = len(conversation.queue)
         queue_note = (f"\n{queued} message(s) are queued and follow as soon as possible."
                       if queued else "")
         if turn.phase == STARTING:
