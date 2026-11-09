@@ -2,6 +2,7 @@
 
 
 import argparse
+import contextlib
 import logging
 from pathlib import Path
 from typing import Annotated
@@ -12,6 +13,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import config as config_module
+from .control import Control
 from .relay import Relay
 from .targets import RelayError
 
@@ -55,7 +57,19 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
     if config.instance_name:
         instructions += (f"\nThis connector works on the user's {config.instance_name}; its "
                          "projects are the ones there.\n")
-    server = MCPServer("agent-relay-mcp", instructions=instructions, version="0.1.0")
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_server):
+        relay.start_background()
+        bus = await start_dbus(config, relay)
+        try:
+            yield None
+        finally:
+            if bus:
+                bus.stop()
+
+    server = MCPServer("agent-relay-mcp", instructions=instructions, version="0.1.0",
+                       lifespan=lifespan)
     max_wait = config.max_wait_seconds
 
     async def guarded(call):
@@ -111,6 +125,30 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         return await guarded(relay.stop(project))
 
     return server, relay
+
+
+async def start_dbus(config: config_module.Config, relay: Relay):
+    """The control interface on the session bus, if configured and possible.
+    Without it nothing can be approved, so everything stays locked."""
+    log = logging.getLogger("agent_relay_mcp")
+    if not config.control_dbus:
+        log.warning("control_dbus is off: projects can only be approved through another "
+                    "control interface")
+        return None
+    try:
+        from .dbus_control import DBusControl
+    except ImportError:
+        log.error("dbus-fast is not installed (pip extra 'desktop'): nothing can be "
+                  "approved, every project stays locked")
+        return None
+    bus = DBusControl(Control(relay))
+    try:
+        await bus.start()
+    except Exception as error:
+        log.error("cannot offer the control interface on the session bus (%s): nothing can "
+                  "be approved, every project stays locked", error)
+        return None
+    return bus
 
 
 def main() -> None:

@@ -17,9 +17,12 @@ Issues = "https://github.com/glashoff/agent-relay-mcp/issues"
 
 [project.scripts]
 agent-relay-mcp = "agent_relay_mcp.server:main"
+agent-relay-ctl = "agent_relay_mcp.ctl:main"
 
 [project.optional-dependencies]
-test = ["pytest"]
+# The control interface on the D-Bus session bus (laptop with a desktop).
+desktop = ["dbus-fast>=2"]
+test = ["pytest", "dbus-fast>=2"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agent_relay_mcp"]

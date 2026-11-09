@@ -1,7 +1,7 @@
 # Access control for agent-relay-mcp: plan
 
-Status: final plan for the laptop, nothing of this is built yet. Written and
-decided 2026-11-09.
+Status: final plan for the laptop, decided 2026-11-09. Built so far (branch
+access-control): steps 2 and 3 of section 9.
 
 Today, whoever can use the Claude account the connector is added to (or knows
 the connector URL) can make Claude Code work in any project. This plan adds
@@ -161,8 +161,8 @@ by default and approved like any other project, but always with a warning.
     confirmation that repeats the warning ("Allow with full access").
   - Notifications for a host project (request, request started, grant ends)
     carry the warning in the title.
-  - `agent-relay-ctl grant` for a host project asks for confirmation (or
-    `--host-project-ok` in scripts).
+  - `agent-relay-ctl grant` for a host project asks for "full access" to be
+    typed on the terminal; there is no option to skip it.
   - The tool texts say it too: `list_projects` shows "no dev container,
     full access", and the reply "waiting for approval" says that the approval
     at the laptop will warn about it, so Claude can mention it to the user.

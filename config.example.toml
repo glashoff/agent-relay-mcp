@@ -55,3 +55,8 @@ request_expiry_minutes = 30
 max_grant_hours = 12
 max_all_grant_hours = 4
 max_host_grant_hours = 2
+
+# Offer grants and approvals on the D-Bus session bus, for the GNOME extension
+# and agent-relay-ctl. Needs the "desktop" extra (dbus-fast); without it,
+# nothing can be approved.
+control_dbus = true

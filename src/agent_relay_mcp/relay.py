@@ -680,6 +680,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
             self.watchers[key] = task
             task.add_done_callback(lambda _: self.watchers.pop(key, None))
 
+    def start_background(self) -> None:
+        """Starts the sweeper and takes up queues; called once the server runs."""
+        self._background()
+
     def _background(self) -> None:
         """Takes up queues left by a restart, and keeps the sweeper going."""
         for key, conversation in self.conversations.items():

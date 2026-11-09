@@ -69,6 +69,9 @@ class Config:
     max_grant_hours: int = 12
     max_all_grant_hours: int = 4
     max_host_grant_hours: int = 2
+    # Offer the control interface (grants, approvals) on the D-Bus session bus,
+    # for the GNOME extension and agent-relay-ctl. Needs the "desktop" extra.
+    control_dbus: bool = True
 
 
 def load(path: Path | None = None) -> Config:

@@ -24,7 +24,7 @@ Four tools:
 
 | Tool | What it does |
 |---|---|
-| `list_projects` | The folders in your projects directory, with whether their container runs, Claude Code is working, or a reply is waiting |
+| `list_projects` | The folders in your projects directory, with whether their container runs, Claude Code is working, a reply is waiting, and whether they are approved |
 | `send_message(project, message, new_conversation=false, wait_seconds=0)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. While Claude Code works, the message is passed into the running request, or queued as the next one. Returns at once, unless `wait_seconds` is set |
 | `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps), or the final reply |
 | `stop(project)` | Ends the current request; the conversation is kept |
@@ -34,6 +34,43 @@ call after somewhere between 20 and 60 seconds. So nothing here waits by
 default: the chat says "Claude Code is working on it", and you ask later. The
 optional `wait_seconds` (at most 15 by default) is for questions that are
 obviously quick.
+
+## Approvals
+
+Every project is locked. A message to a locked project does not run; it
+becomes a request with a two-digit number, which the chat tells you. You
+approve it at the computer, and the message then runs by itself. Nothing the
+chat or Claude Code can call gives approvals: they come only through the
+control interface on the D-Bus session bus, used by the GNOME extension (coming)
+and by `agent-relay-ctl`:
+
+```sh
+agent-relay-ctl                        # grants, waiting requests, projects
+agent-relay-ctl approve 47 --for 2h    # approve request 47, granting its project
+agent-relay-ctl deny 47
+agent-relay-ctl grant web --for 1h     # approve a project in advance (or --all)
+agent-relay-ctl revoke web             # running requests finish; --stop ends them
+agent-relay-ctl watch                  # events as they come
+```
+
+- **Grants** cover one project or all projects with a dev container, and end
+  after their time, after 30 minutes without a message or a running request,
+  and, if they say so, when the screen locks (the default for all projects
+  and for full access). Upper limits: 12 h for a project, 4 h for all
+  projects, 2 h for full access.
+- **Full access**: projects without a dev container, and a project with one
+  that you choose to run on the host instead (`--on-host`, with a
+  conversation of its own there), run as you with access to everything. Their
+  grants need you to type "full access". A project changes between its dev
+  container and the host only while the other side is idle (`--when-idle`
+  waits for that).
+- **Revoking** lets a running request finish; messages queued for it wait for
+  approval again. `--stop` ends it.
+- `agent-relay-ctl` asks for a confirmation typed on the terminal, and the
+  relay accepts grants only from GNOME Shell or a process with a terminal, so
+  Claude Code started by the relay cannot approve anything. Grants are kept in
+  `~/.local/state/agent-relay-mcp/access.json`; an unreadable file locks
+  everything.
 
 ## How it works
 
@@ -81,7 +118,9 @@ obviously quick.
 ## Install
 
 ```sh
-pipx install git+https://github.com/glashoff/agent-relay-mcp   # or: pipx install .
+pipx install 'agent-relay-mcp[desktop] @ git+https://github.com/glashoff/agent-relay-mcp'
+# or, from a checkout: pipx install '.[desktop]'
+# [desktop] adds dbus-fast, needed for approvals; agent-relay-ctl comes with it
 mkdir -p ~/.config/agent-relay-mcp
 cp config.example.toml ~/.config/agent-relay-mcp/config.toml
 $EDITOR ~/.config/agent-relay-mcp/config.toml               # public_hosts at least
@@ -132,11 +171,17 @@ choose *Continue anyway*.
 
 Read this before exposing it.
 
-- **The URL is the only credential.** There is no sign-in: whoever knows the
-  URL can make Claude Code work in any of your projects. Treat it like a
-  password, keep it out of logs, and change it (in the proxy and the
+- **The URL lets anyone ask.** There is no sign-in: whoever knows the URL can
+  send requests, which then wait for your approval (section "Approvals"), and
+  can use whatever you have approved while the grant lasts. Treat the URL
+  like a password, keep it out of logs, and change it (in the proxy and the
   connector) if it may have leaked. OAuth would add a real sign-in at the cost
   of running an authorization server; it is not implemented.
+- **Approvals are as strong as this user account.** Claude Code in a project
+  without a dev container (or one approved to run on the host) runs as you
+  and could change the relay, its grants or its code. Grant full access only
+  for as long as needed, and install the relay from a fixed version rather
+  than editable from a folder Claude Code works in.
 - **The container is the boundary.** Claude Code in auto mode runs commands and
   changes files without asking. What a request can do is what the project's
   container can do: its mounts, its network, the credentials inside it. Keep
@@ -159,7 +204,8 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[test]'
 ```
 
 The tests replace Claude Code with `tests/fake_claude.py` and use projects
-without containers, so they need neither Docker nor an account.
+without containers, so they need neither Docker nor an account. The D-Bus
+tests start a private `dbus-daemon`, never touching the session bus.
 
 ## License
 
