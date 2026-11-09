@@ -74,6 +74,15 @@ class Control:
     async def cancel_switch(self, project: str) -> None:
         await self._call(self.relay.cancel_switch(project))
 
+    async def stop_project(self, project: str, lock: bool = False) -> dict:
+        return await self._call(self.relay.stop_project(project, lock))
+
+    def keep_awake(self, mode: str, lid: bool) -> dict:
+        try:
+            return self.relay.set_keep_awake(mode, lid)
+        except AccessError as error:
+            raise ControlError(str(error)) from error
+
     async def screen_locked(self) -> None:
         await self._call(self.relay.screen_locked())
 

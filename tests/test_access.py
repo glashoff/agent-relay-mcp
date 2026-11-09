@@ -456,6 +456,29 @@ def test_releasing_never_grants(setup):
     run(scenario())
 
 
+def test_stop_and_lock_from_the_laptop(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        await control.grant(ALL)
+        await relay.send_message("web", "sleep 30", False, 0)
+        await until_running(relay, "web")
+        result = await control.stop_project("web", lock=True)
+        assert result == {"stopped": 1, "revoked": ["*"]}
+        assert relay.conversations["web"].turn.phase == "failed"
+        assert "locked" in await relay.send_message("web", "hi", False, 0)
+    run(scenario())
+
+
+def test_keep_awake_settings_through_the_control_layer(setup):
+    control = Control(Relay(setup))
+    state = control.keep_awake("granted", True)
+    assert state["mode"] == "granted" and state["lid"]
+    assert control.state()["keep_awake"]["mode"] == "granted"
+    with pytest.raises(ControlError, match="Unknown mode"):
+        control.keep_awake("always", False)
+
+
 # --- the control layer --------------------------------------------------------------
 
 def test_state_and_events(setup):

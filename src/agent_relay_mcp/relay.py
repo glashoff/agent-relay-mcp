@@ -37,6 +37,7 @@ from .access import (ALL, CONTAINER, HOST, HOST_WARNING, ON_HOST_WARNING, Access
                      AccessError, Grant, Limits, Switch)
 from .config import Config
 from .events import TurnOutput, complete_lines
+from .keep_awake import KeepAwake
 from .targets import Project, RelayError, Target
 
 log = logging.getLogger("agent_relay_mcp")
@@ -172,7 +173,12 @@ class Relay:
             max_project=config.max_grant_hours * 3600,
             max_all=config.max_all_grant_hours * 3600,
             max_host=config.max_host_grant_hours * 3600))
+        self.keep_awake = KeepAwake(config.state_dir / "keep_awake.json")
         self._load()
+
+    def close(self) -> None:
+        """Lets the computer sleep again; called when the server stops."""
+        self.keep_awake.close()
 
     # --- persistence -------------------------------------------------------
 
@@ -624,6 +630,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     earlier_reply=earlier_reply)
         conversation.turn = turn
         self._save()
+        self._update_keep_awake()
         self._emit("run_started", project=project.name,
                    kind=self._kind_of(project, conversation),
                    full_access=self._kind_of(project, conversation) == HOST,
@@ -1155,6 +1162,57 @@ kill -KILL -- "-$p" 2>/dev/null || true
             if project:
                 await self._advance_switch(project, switch)
         self.access.save()
+        self._update_keep_awake()
+
+    def _update_keep_awake(self) -> None:
+        now = self.clock()
+        running = any(c.turn and c.turn.phase in (STARTING, RUNNING)
+                      for c in self.conversations.values())
+        granted = any(self.access.live(g, now) for g in self.access.grants.values())
+        was = self.keep_awake.active
+        note = self.keep_awake.update(running=running, granted=granted, now=now)
+        if note:
+            self._emit("keep_awake_dropped", reason=note)
+        if was != self.keep_awake.active:
+            self._emit("keep_awake", active=self.keep_awake.active)
+
+    def set_keep_awake(self, mode: str, lid: bool) -> dict:
+        try:
+            self.keep_awake.configure(mode, lid)
+        except ValueError as error:
+            raise AccessError(str(error)) from error
+        self._update_keep_awake()
+        self._emit("keep_awake_changed", mode=mode, lid=lid)
+        return self.keep_awake.state()
+
+    async def stop_project(self, project_name: str, lock: bool) -> dict:
+        """For the laptop: stops what runs in a project; with lock, also ends
+        the grants that cover it (for all projects too, if one does)."""
+        project = self._project(project_name)
+        async with self._lock(project.name):
+            stopped = 0
+            for _, conversation in self._project_conversations(project):
+                working = conversation.turn and conversation.turn.phase == RUNNING
+                if working or conversation.queue:
+                    await self._stop_conversation(project, conversation)
+                    stopped += bool(working)
+            switch = self.access.switches.pop(project.name, None)
+        ended = []
+        if lock:
+            now = self.clock()
+            while True:
+                grant = self.access.covering(project.name, natural(project), now,
+                                             idle_ok=True)
+                if not grant:
+                    break
+                self.access.end(grant.id)
+                ended.append(grant.target)
+                self._emit("grant_ended", grant=grant.id, reason="stopped and locked",
+                           stopped=True)
+                await self._after_grant_end(grant, True)
+        if switch or ended:
+            self.access.save()
+        return {"stopped": stopped, "revoked": ended}
 
     async def _advance_switch(self, project: Project, switch: Switch) -> None:
         async with self._lock(project.name):
@@ -1222,6 +1280,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 "busy": busy})
         return {
             "instance": self.config.instance_name,
+            "keep_awake": self.keep_awake.state(),
             "allow_host": self.config.allow_host_projects,
             "projects": projects,
             "grants": [self._grant_info(g, now) for g in self.access.grants.values()

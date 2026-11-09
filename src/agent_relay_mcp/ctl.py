@@ -5,6 +5,8 @@
     agent-relay-ctl approve 47            approve the request with number 47
     agent-relay-ctl deny 47
     agent-relay-ctl revoke web [--stop]   end a grant (or --all)
+    agent-relay-ctl stop web [--lock]     stop what runs there (and end its grants)
+    agent-relay-ctl keep-awake running    off, running or granted; --lid too
     agent-relay-ctl watch                 print events as they come
 
 Grants and approvals ask for a confirmation typed on the terminal, so they do
@@ -127,6 +129,12 @@ def show_state(state: dict) -> None:
         where_to = "on the host" if s["kind"] == "host" else "in the dev container"
         print(f"\nSwitch waiting: {s['project']} to run {where_to} once idle "
               f"({s['held']} message(s) held), gives up in {until(s['expires'] - now)}")
+    k = state.get("keep_awake")
+    if k:
+        lid = ", also with the lid closed" if k["lid"] else ""
+        held = "now holding" if k["active"] else "not holding now"
+        reason = f" ({k['reason']})" if k["reason"] else ""
+        print(f"\nKeep awake: {k['mode']}{lid}; {held}{reason}")
     print("\nProjects:")
     for p in state["projects"]:
         kind = {"host": "on the host", "container": "in the dev container"}.get(p["kind"])
@@ -247,6 +255,19 @@ async def command(args, client: Client) -> None:
             " Running requests may finish."
         print(f"Revoked {grant}.{stopped}")
         return
+    if args.command == "stop":
+        result = json.loads(await client.call("StopProject", "sb", [args.project, args.lock]))
+        text = f"Stopped {result['stopped']} running request(s) in {args.project}."
+        if result["revoked"]:
+            text += " Ended the grant(s) for: " + ", ".join(
+                "all projects" if t == "*" else t for t in result["revoked"]) + "."
+        print(text)
+        return
+    if args.command == "keep-awake":
+        state = json.loads(await client.call("SetKeepAwake", "sb", [args.mode, args.lid]))
+        print(f"Keep awake: {state['mode']}" + (", also with the lid closed" if state["lid"]
+                                                else "") + ".")
+        return
     if args.command == "cancel-switch":
         await client.call("CancelSwitch", "s", [args.project])
         print(f"Cancelled the switch of {args.project}.")
@@ -317,6 +338,16 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("grant", nargs="?", help="grant id or project")
     r.add_argument("--all", action="store_true")
     r.add_argument("--stop", action="store_true", help="also stop running requests")
+
+    t = sub.add_parser("stop", help="stop what Claude Code does in a project")
+    t.add_argument("project")
+    t.add_argument("--lock", action="store_true",
+                   help="also end the grants that cover it (all projects, if that is one)")
+
+    k = sub.add_parser("keep-awake", help="when to keep the computer from sleeping")
+    k.add_argument("mode", choices=["off", "running", "granted"])
+    k.add_argument("--lid", action="store_true",
+                   help="also keep it running with the lid closed (warm in a bag!)")
 
     c = sub.add_parser("cancel-switch", help="cancel a waiting switch")
     c.add_argument("project")

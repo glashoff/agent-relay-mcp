@@ -61,6 +61,16 @@ INTROSPECTION = f"""<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Intr
       <arg direction="out" type="u" name="revoked"/>
     </method>
     <method name="CancelSwitch"><arg direction="in" type="s" name="project"/></method>
+    <method name="StopProject">
+      <arg direction="in" type="s" name="project"/>
+      <arg direction="in" type="b" name="lock"/>
+      <arg direction="out" type="s" name="result"/>
+    </method>
+    <method name="SetKeepAwake">
+      <arg direction="in" type="s" name="mode"/>
+      <arg direction="in" type="b" name="lid"/>
+      <arg direction="out" type="s" name="state"/>
+    </method>
     <signal name="Event"><arg type="s" name="event"/></signal>
   </interface>
   <interface name="org.freedesktop.DBus.Introspectable">
@@ -78,6 +88,8 @@ METHODS = {
     "Revoke": ("sb", "s", False),
     "RevokeAll": ("b", "u", False),
     "CancelSwitch": ("s", "", False),
+    "StopProject": ("sb", "s", False),
+    "SetKeepAwake": ("sb", "s", True),
 }
 
 GRANT_OPTIONS = {"target", "kind", "minutes", "end_on_lock", "include_host_projects",
@@ -236,6 +248,10 @@ class DBusControl:
             return json.dumps(await c.revoke(body[0], body[1]))
         if member == "RevokeAll":
             return await c.revoke_all(body[0])
+        if member == "StopProject":
+            return json.dumps(await c.stop_project(body[0], body[1]))
+        if member == "SetKeepAwake":
+            return json.dumps(c.keep_awake(body[0], body[1]))
         if member == "CancelSwitch":
             await c.cancel_switch(body[0])
             return None

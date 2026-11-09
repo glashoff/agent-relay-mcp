@@ -70,6 +70,7 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         finally:
             if bus:
                 bus.stop()
+            relay.close()
 
     server = MCPServer("agent-relay-mcp", instructions=instructions, version="0.1.0",
                        lifespan=lifespan)
