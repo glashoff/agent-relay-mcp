@@ -1,0 +1,7 @@
+{
+  "uuid": "agent-relay@glashoff.github.io",
+  "name": "Agent Relay",
+  "description": "Approve requests to agent-relay-mcp, see and revoke its grants, keep the computer awake while Claude Code works, and start or stop the relay.",
+  "shell-version": ["48"],
+  "url": "https://github.com/glashoff/agent-relay-mcp"
+}

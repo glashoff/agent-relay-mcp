@@ -107,7 +107,9 @@ def show_state(state: dict) -> None:
     for g in grants:
         target = "all projects" + (" incl. host projects" if g["include_host_projects"]
                                    else "") if g["target"] == "*" else g["target"]
-        kind = " on the host" if g["kind"] == "host" and g["target"] != "*" else ""
+        container = any(p["name"] == g["target"] and p["dev_container"]
+                        for p in state["projects"])
+        kind = " on the host" if g["kind"] == "host" and container else ""
         flags = []
         if g["full_access"]:
             flags.append("FULL ACCESS")

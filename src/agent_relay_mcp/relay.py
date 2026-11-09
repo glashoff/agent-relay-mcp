@@ -173,7 +173,8 @@ class Relay:
             max_project=config.max_grant_hours * 3600,
             max_all=config.max_all_grant_hours * 3600,
             max_host=config.max_host_grant_hours * 3600))
-        self.keep_awake = KeepAwake(config.state_dir / "keep_awake.json")
+        self.keep_awake = KeepAwake(config.state_dir / "keep_awake.json",
+                                    command=config.keep_awake_command)
         self._load()
 
     def close(self) -> None:

@@ -1,0 +1,9 @@
+.agent-relay-heading { font-weight: bold; }
+.agent-relay-warning { color: #f8b84e; font-weight: bold; }
+.agent-relay-dim { color: rgba(255, 255, 255, 0.6); }
+.agent-relay-message { font-style: italic; max-width: 26em; }
+.agent-relay-buttons { spacing: 6px; padding-top: 4px; }
+.agent-relay-buttons .button { padding: 3px 10px; }
+.agent-relay-count { font-weight: bold; padding-left: 2px; }
+.agent-relay-dialog { spacing: 12px; max-width: 32em; }
+.agent-relay-dialog .button.selected { background-color: -st-accent-color; color: -st-accent-fg-color; }

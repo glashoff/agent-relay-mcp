@@ -60,3 +60,7 @@ max_host_grant_hours = 2
 # and agent-relay-ctl. Needs the "desktop" extra (dbus-fast); without it,
 # nothing can be approved.
 control_dbus = true
+
+# Keeps the computer awake while Claude Code works (mode set in the GNOME menu
+# or with agent-relay-ctl keep-awake); empty: never.
+keep_awake_command = "systemd-inhibit"

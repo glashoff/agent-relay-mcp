@@ -72,6 +72,9 @@ class Config:
     # Offer the control interface (grants, approvals) on the D-Bus session bus,
     # for the GNOME extension and agent-relay-ctl. Needs the "desktop" extra.
     control_dbus: bool = True
+    # Holds the inhibitor that keeps the computer awake (see keep_awake.py);
+    # empty: never keep it awake.
+    keep_awake_command: str = "systemd-inhibit"
 
 
 def load(path: Path | None = None) -> Config:

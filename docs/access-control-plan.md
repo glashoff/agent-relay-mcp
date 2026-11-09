@@ -1,7 +1,8 @@
 # Access control for agent-relay-mcp: plan
 
 Status: final plan for the laptop, decided 2026-11-09. Built so far (branch
-access-control): steps 2 and 3 of section 9.
+access-control): steps 2 to 6 of section 9; the lid behaviour of step 4 is
+still to be checked at the laptop.
 
 Today, whoever can use the Claude account the connector is added to (or knows
 the connector URL) can make Claude Code work in any project. This plan adds

@@ -42,8 +42,8 @@ Every project is locked. A message to a locked project does not run; it
 becomes a request with a two-digit number, which the chat tells you. You
 approve it at the computer, and the message then runs by itself. Nothing the
 chat or Claude Code can call gives approvals: they come only through the
-control interface on the D-Bus session bus, used by the GNOME extension (coming)
-and by `agent-relay-ctl`:
+control interface on the D-Bus session bus, used by the GNOME extension
+(below) and by `agent-relay-ctl`:
 
 ```sh
 agent-relay-ctl                        # grants, waiting requests, projects
@@ -72,6 +72,34 @@ agent-relay-ctl watch                  # events as they come
   Claude Code started by the relay cannot approve anything. Grants are kept in
   `~/.local/state/agent-relay-mcp/access.json`; an unreadable file locks
   everything.
+
+### The GNOME extension
+
+`gnome-extension/` holds an extension for GNOME Shell 48: an icon in the top
+bar (a padlock; open when something is approved, a warning sign for full
+access; with the number of waiting requests) and a tile in quick settings,
+both with the same menu: the relay service with start, stop and restart,
+requests waiting for approval, active grants with revoke, giving grants, and
+keeping the computer awake. It notifies about new requests (with allow and
+deny), grants about to end, and requests that start (with stop). It does not
+run on the lock screen; after unlocking it says what is waiting.
+
+```sh
+gnome-extension/install.sh       # copies it into ~/.local/share/gnome-shell/extensions
+# log out and in (Wayland), then:
+gnome-extensions enable agent-relay@glashoff.github.io
+```
+
+`gnome-extension/test-in-headless-shell.sh` runs it in a headless GNOME Shell
+with a private session bus, its own folders and a throwaway relay, and leaves
+screenshots; it touches nothing of the running session.
+
+### Keeping the computer awake
+
+While a request runs (and five minutes after), the relay keeps the computer
+from going to sleep by idling, through a systemd-logind inhibitor. Other modes:
+off, or while anything is approved; and optionally also with the lid closed
+(it gets warm in a bag). It lets go on battery below 20 %.
 
 ## How it works
 
