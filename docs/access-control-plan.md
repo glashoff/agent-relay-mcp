@@ -395,3 +395,52 @@ and then walking away, and the screen locks a few minutes later. Instead:
 
 1. A panel icon (lock state, number of open requests) in addition to quick
    settings? Needed only for step 5.
+
+## 11. Security review (2026-11-09)
+
+A separate review of the branch, focused on ways through MCP and out of a dev
+container. Accepted and not counted as findings: a granted host project runs
+as the user and can change the approval system.
+
+Fixed, each with a test:
+
+- **Critical: a container grant could run on the host.** Claude Code in a
+  container could delete devcontainer.json; the next message under the
+  container grant then ran on the host. Grants now record whether the project
+  had a dev container and stop covering it when that changes; where a
+  conversation runs follows the grant's kind, never what is stored; nothing
+  falls back to the host without a grant for it.
+- **High: a container could change what runs on the host when it is
+  started.** devcontainer.json runs `initializeCommand`, mounts and runArgs on
+  this computer. The relay no longer starts a stopped dev container whose
+  earlier container could write `.devcontainer` (not mounted read-only); it
+  says so, and the container is started at the computer instead. On this
+  laptop all containers mount it read-only except webgame's
+  (`start_writable_devcontainers` overrides).
+- **Medium: unbounded output** from a run could exhaust the relay's memory:
+  reading is limited per poll, overlong lines are skipped, kept steps and
+  results are capped, malformed output is skipped.
+- **Medium: grants stayed valid without a control interface** (no dbus-fast,
+  no bus, name taken): then nothing could revoke them, so none counts now.
+- **Medium: a folder named `*`** looked like the grant for all projects:
+  such names are not projects.
+- **Low:** the run's pid file (writable in the container) is no longer trusted
+  (pid seen at launch; never 0 or 1 for kill); session ids from the output
+  must be UUIDs; a request can no longer be approved after it expired or after
+  messages were added to it since it was shown; at most 20 messages per
+  request; an access.json that is valid JSON but malformed locks everything
+  instead of crashing; state.json is private (0600); grants that end on lock
+  end at start if the screen is locked; scripts use private temp files, warn
+  when installing from a worktree, and rollback.sh warns that versions
+  without access control leave every project open.
+
+Remaining, by design or for later:
+
+- The D-Bus caller check is a hurdle, not a wall: any process of the user can
+  pass it (for example with `script` for a terminal). Containers and MCP
+  cannot reach it; host processes are the accepted risk.
+- The relay is installed editable from the checkout (decided), so changes in
+  the checkout take effect at the next restart.
+- Another process of the user could own the bus name before the relay; the
+  relay then has no control interface and every project stays locked, but the
+  extension would show the other process's state.

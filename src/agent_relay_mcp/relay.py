@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shlex
 import time
 import uuid
@@ -73,12 +74,15 @@ class Turn:
     # from the run, but only when needed: a reply not yet reported.
     output_loaded: bool = True
     closed: bool = False       # the run takes no more messages
+    # The process id of the run, as seen at launch. The run directory is
+    # writable where the run is, so its pid file is not trusted.
+    pid: int = 0
 
     def to_state(self) -> dict:
         return {"id": self.id, "message": self.message, "started": self.started,
                 "phase": self.phase, "error": self.error, "delivered": self.delivered,
                 "resumed": self.resumed, "born": self.born, "passed_in": self.passed_in,
-                "earlier_reply": self.earlier_reply}
+                "earlier_reply": self.earlier_reply, "pid": self.pid}
 
 
 @dataclass
@@ -129,9 +133,21 @@ def _user_message(text: str) -> bytes:
                         "parent_tool_use_id": None, "session_id": ""}) + "\n").encode()
 
 
+READ_LIMIT = 4 * 1024 * 1024    # bytes of output read per poll
+
+
 def _run_dir(turn_id: str) -> str:
     uuid.UUID(turn_id)          # never anything else in a shell command
     return f'{RUN_ROOT}/{turn_id}'
+
+
+def _pid(turn: "Turn") -> str:
+    """Shell that sets p to the run's process id, or to "" if there is none
+    that can be trusted: never 0 or 1 (kill -- -1 would hit every process)."""
+    if turn.pid > 1:
+        return f"p={turn.pid}"
+    # Runs started before the relay kept the pid itself.
+    return 'p="$(cat "$d/pid" 2>/dev/null)"; case "$p" in ""|*[!0-9]*|0|1) p="" ;; esac'
 
 
 def natural(project: Project) -> str:
@@ -193,9 +209,15 @@ class Relay:
             return
         for name, entry in raw.items():
             turn = entry.get("turn")
+            on_host = entry.get("on_host")
+            if on_host is None:
+                # Written before conversations knew where they run: then a
+                # project without a dev container ran on the host.
+                folder = self.config.projects_dir / name.split("/")[0]
+                on_host = not ((folder / ".devcontainer/devcontainer.json").is_file()
+                               or (folder / ".devcontainer.json").is_file())
             conversation = Conversation(entry.get("session_id", ""),
-                                        queue=entry.get("queue") or [],
-                                        on_host=entry.get("on_host", False))
+                                        queue=entry.get("queue") or [], on_host=on_host)
             if turn:
                 conversation.turn = Turn(**turn, output_loaded=False)
                 if conversation.turn.phase == STARTING:
@@ -211,7 +233,9 @@ class Relay:
                        "queue": c.queue, "on_host": c.on_host}
                 for name, c in self.conversations.items()}
         tmp = self.state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:      # it holds the messages
+            json.dump(data, f, indent=2)
         tmp.replace(self.state_file)
 
     def _lock(self, name: str) -> asyncio.Lock:
@@ -241,10 +265,23 @@ class Relay:
     # --- conversations and where they run -------------------------------------
 
     def _conversation(self, project: Project, kind: str) -> Conversation:
+        """The conversation of project when it runs as kind. Where it runs
+        follows the kind, never what is stored: a project that gained or lost
+        its dev container gets a fresh conversation in the right place."""
         key = _key(project, kind)
+        on_host = kind == HOST
         conversation = self.conversations.get(key)
         if conversation is None:
-            conversation = self.conversations[key] = Conversation(on_host=kind == HOST)
+            conversation = self.conversations[key] = Conversation(on_host=on_host)
+        elif conversation.on_host != on_host:
+            if conversation.busy:
+                raise RelayError(f"{project.name} changed (its dev container was added or "
+                                 "removed) while Claude Code still works there; stop it "
+                                 "first.")
+            log.warning("%s now runs %s; starting a new conversation there", project.name,
+                        "on the host" if on_host else "in its dev container")
+            conversation.on_host = on_host
+            conversation.session_id = ""
         return conversation
 
     def _project_conversations(self, project: Project) -> list[tuple[str, Conversation]]:
@@ -324,11 +361,15 @@ mkfifo "$d/in"
 echo 0 > "$d/mark"
 setsid sh -c {shlex.quote(_RUNNER)} "$d" {claude} < /dev/null > /dev/null 2>&1 &
 echo $! > "$d/pid"
+echo "PID $!"
 """
         result = targets.run_in(self.config, target, script, stdin=_user_message(turn.message))
         if result.returncode != 0:
             raise RelayError("Claude Code could not be started: "
                              + result.stderr.decode(errors="replace").strip()[-800:])
+        for line in result.stdout.decode(errors="replace").splitlines():
+            if line.startswith("PID ") and line[4:].strip().isdigit():
+                turn.pid = int(line[4:].strip())
 
     def _pass_in(self, target: Target, turn: Turn, message: str) -> bool:
         """Passes message into the running run; False if it takes none any more
@@ -339,7 +380,8 @@ d={d}
 [ -p "$d/in" ] || {{ echo CLOSED; exit 0; }}
 exec 9> "$d/lock"
 flock -w 10 9 2>/dev/null
-if [ -e "$d/closed" ] || [ -e "$d/exit" ] || ! kill -0 "$(cat "$d/pid")" 2>/dev/null; then
+{_pid(turn)}
+if [ -e "$d/closed" ] || [ -e "$d/exit" ] || [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
     echo CLOSED; exit 0
 fi
 r=$(grep -c '"type": *"result"' "$d/out.jsonl" 2>/dev/null)
@@ -359,11 +401,12 @@ fi
         d = _run_dir(turn.id)
         script = f"""
 d={d}
-if [ -f "$d/exit" ]; then echo "EXIT $(cat "$d/exit")"
-elif [ ! -f "$d/pid" ]; then echo MISSING
-elif kill -0 "$(cat "$d/pid")" 2>/dev/null; then echo RUNNING
+{_pid(turn)}
+if [ -f "$d/exit" ]; then echo "EXIT $(head -c 20 "$d/exit" | tr -d '\n')"
+elif [ -z "$p" ]; then echo MISSING
+elif kill -0 "$p" 2>/dev/null; then echo RUNNING
 else echo GONE; fi
-tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null
+tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
 """
         result = targets.run_in(self.config, target, script)
         status, _, data = result.stdout.partition(b"\n")
@@ -371,6 +414,8 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null
         lines, used = complete_lines(data)
         for line in lines:
             turn.output.feed(line)
+        if not used and len(data) >= READ_LIMIT:
+            used = len(data)        # one line longer than the limit: skip it
         turn.offset += used
         turn.output_loaded = True
         turn.born = turn.born or bool(turn.output.session_id)
@@ -397,7 +442,7 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null
         d = _run_dir(turn.id)
         script = f"""
 d={d}
-p="$(cat "$d/pid" 2>/dev/null)"
+{_pid(turn)}
 [ -n "$p" ] || exit 0
 kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
 for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$p" 2>/dev/null || exit 0; sleep 0.5; done
@@ -435,7 +480,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
 
     @staticmethod
     def _kind_of(project: Project, conversation: Conversation) -> str:
-        return HOST if conversation.on_host or not project.has_devcontainer else CONTAINER
+        return HOST if conversation.on_host else CONTAINER
 
     async def _load_output(self, project: Project, conversation: Conversation) -> bool:
         """Reads the reply of a finished turn again from its run, after a restart.
@@ -979,12 +1024,12 @@ kill -KILL -- "-$p" 2>/dev/null || true
 
     async def approve(self, request_id: str, kind: str | None = None, seconds: int = 3600, *,
                       end_on_lock: bool | None = None, full_access_ok: bool = False,
-                      when_idle: bool = False) -> dict:
+                      when_idle: bool = False, messages: int | None = None) -> dict:
         """Approves an open request with a grant for its project; its messages
         then run as if they had just been sent."""
         self._background()
         request = self.access.requests.get(request_id)
-        if not request:
+        if not request or self.clock() >= request.expires:
             raise AccessError(f"There is no open request {request_id}; it may have "
                               "expired or been answered already.")
         project = self._project(request.project)
@@ -995,6 +1040,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
         async with self._lock(project.name):
             now = self.clock()
             await self._refresh_all(project)
+            self.access.check_request(request_id, now, messages)
             busy = self._busy_kind(project)
             if busy and busy != kind:
                 result = self._switch(project, kind, params, when_idle, request.messages, now)
@@ -1003,7 +1049,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 self._emit("request_answered", request=request_id, project=project.name,
                            approved=True)
                 return result
-            self.access.take_request(request_id)
+            self.access.take_request(request_id, now, messages)
             grant = self._add_grant(project, params, now)
             self._emit("request_answered", request=request_id, project=project.name,
                        approved=True)

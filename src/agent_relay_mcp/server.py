@@ -63,8 +63,14 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
 
     @contextlib.asynccontextmanager
     async def lifespan(_server):
-        relay.start_background()
         bus = await start_dbus(config, relay)
+        if bus is None:
+            # Nothing could revoke a grant now, so none counts (fail closed).
+            relay.access.suspended = "no control interface"
+            logging.getLogger("agent_relay_mcp").error(
+                "without a control interface every project stays locked, also those "
+                "approved before")
+        relay.start_background()
         try:
             yield None
         finally:

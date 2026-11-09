@@ -50,6 +50,10 @@ SHA=$(git -C "$SRC" rev-parse --verify --quiet "$COMMIT^{commit}") \
     || fail "$COMMIT is not a commit in $SRC."
 SUBJECT=$(git -C "$SRC" log -1 --format=%s "$SHA")
 say "Rolling the relay back to ${SHA:0:7}: $SUBJECT"
+if ! git -C "$SRC" show "$SHA:src/agent_relay_mcp/access.py" > /dev/null 2>&1; then
+    printf '\033[1;31m    WARNING: this version has no access control. Every project is open to\n'
+    printf '    whoever can use the connector, without approval.\033[0m\n'
+fi
 if [ "$YES" = 0 ] && [ "$DRY" = 0 ]; then
     printf '    The running relay is replaced by this version and restarted. Continue? [y/N] '
     read -r answer < /dev/tty || answer=""

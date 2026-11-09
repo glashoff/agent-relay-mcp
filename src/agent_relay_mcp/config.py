@@ -75,6 +75,9 @@ class Config:
     # Holds the inhibitor that keeps the computer awake (see keep_awake.py);
     # empty: never keep it awake.
     keep_awake_command: str = "systemd-inhibit"
+    # Start a stopped dev container even if an earlier container of the
+    # project could write its .devcontainer (see targets.may_start).
+    start_writable_devcontainers: bool = False
 
 
 def load(path: Path | None = None) -> Config:

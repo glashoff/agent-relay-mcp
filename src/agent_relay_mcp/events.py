@@ -3,7 +3,20 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass, field
+
+MAX_STEPS = 200
+MAX_RESULTS = 20
+
+
+def _uuid(value) -> str:
+    """value if it is a UUID, else "": session ids come from the run's output,
+    which the container writes, and end up as an argument of claude."""
+    try:
+        return str(uuid.UUID(value)) if isinstance(value, str) else ""
+    except ValueError:
+        return ""
 
 # Input field that best says what a tool call does, per tool.
 _SUMMARY_FIELDS = {
@@ -45,15 +58,23 @@ class TurnOutput:
     cost_usd: float | None = None
 
     def feed(self, line: str) -> None:
+        """Takes one line of output. The output is written where the run is, so
+        in a dev container by whatever runs there: anything malformed is skipped."""
         try:
             event = json.loads(line)
         except ValueError:
             return
         if not isinstance(event, dict):
             return
+        try:
+            self._feed(event)
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    def _feed(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "system" and event.get("subtype") == "init":
-            self.session_id = event.get("session_id") or self.session_id
+            self.session_id = _uuid(event.get("session_id")) or self.session_id
         elif kind == "assistant" and event.get("parent_tool_use_id") is None:
             for block in (event.get("message") or {}).get("content") or []:
                 if block.get("type") == "text" and block.get("text", "").strip():
@@ -61,14 +82,16 @@ class TurnOutput:
                 elif block.get("type") == "tool_use":
                     self.steps.append(summarize_tool(block.get("name", "?"),
                                                      block.get("input") or {}))
+                    del self.steps[:-MAX_STEPS]
         elif kind == "result":
-            self.session_id = event.get("session_id") or self.session_id
-            self.result = event.get("result") or ""
+            self.session_id = _uuid(event.get("session_id")) or self.session_id
+            self.result = str(event.get("result") or "")
             self.is_error = bool(event.get("is_error")) or event.get("subtype") != "success"
             if self.is_error and not self.result:
                 errors = event.get("errors") or []
                 self.result = "; ".join(map(str, errors)) or str(event.get("subtype"))
             self.results.append(self.result)
+            del self.results[:-MAX_RESULTS]
             self.duration_ms = int(event.get("duration_ms") or 0)
             self.cost_usd = event.get("total_cost_usd")
 

@@ -34,6 +34,7 @@ def setup(tmp_path, monkeypatch):
     (projects / "web/.devcontainer/devcontainer.json").write_text("{}")
     # The dev container of "web", stubbed: runs on the host as well.
     real_target_for = targets.target_for
+    monkeypatch.setattr(targets, "REAL_TARGET_FOR", real_target_for, raising=False)
     monkeypatch.setattr(targets, "running_container", lambda config, project: "stub")
     monkeypatch.setattr(targets, "target_for",
                         lambda config, project, *, start, on_host=False: real_target_for(
@@ -519,3 +520,137 @@ def test_unknown_things_are_reported(setup):
 def test_access_error_is_not_a_relay_error():
     # Control errors never reach the MCP tools as something they could act on.
     assert not issubclass(AccessError, targets.RelayError)
+
+
+# --- from the security review -------------------------------------------------------
+
+def test_a_container_grant_never_runs_on_the_host_when_the_dev_container_is_gone(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await Control(relay).grant("web")              # for the dev container
+        # Claude Code in the container deletes the project's devcontainer.json.
+        (setup.projects_dir / "web/.devcontainer/devcontainer.json").unlink()
+        answer = await relay.send_message("web", "now on the host?", False, 0)
+        assert "locked" in answer and "full access" in answer
+        assert "web" not in relay.conversations
+    run(scenario())
+
+
+def test_the_place_follows_the_grant_not_the_stored_conversation(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        await control.grant("alpha", full_access_ok=True)
+        await relay.send_message("alpha", "quick", False, 8)
+        assert relay.conversations["alpha"].on_host
+        old_session = relay.conversations["alpha"].session_id
+        # alpha gets a dev container; the old grant does not cover it any more.
+        (setup.projects_dir / "alpha/.devcontainer").mkdir()
+        (setup.projects_dir / "alpha/.devcontainer/devcontainer.json").write_text("{}")
+        assert "locked" in await relay.send_message("alpha", "again", False, 0)
+        await control.deny(next(iter(relay.access.requests)))
+        await control.grant("alpha")                     # now for its dev container
+        await relay.send_message("alpha", "in the container", False, 8)
+        conversation = relay.conversations["alpha"]
+        assert not conversation.on_host and conversation.session_id != old_session
+    run(scenario())
+
+
+def test_without_a_dev_container_nothing_falls_back_to_the_host(setup):
+    project = targets.Project("alpha", setup.projects_dir / "alpha")
+    with pytest.raises(targets.RelayError, match="no dev container"):
+        targets.REAL_TARGET_FOR(setup, project, start=False, on_host=False)
+
+
+def test_a_folder_named_star_is_not_a_project(setup):
+    (setup.projects_dir / "*").mkdir()
+    names = [p.name for p in targets.list_projects(setup)]
+    assert "*" not in names
+    with pytest.raises(targets.RelayError, match="Invalid project name"):
+        targets.find_project(setup, "*")
+
+
+def test_requests_that_expired_or_changed_cannot_be_approved(setup):
+    clock = Clock()
+
+    async def scenario():
+        relay = relay_at(setup, clock)
+        control = Control(relay)
+        await relay.send_message("web", "one", False, 0)
+        request = only_request(relay)
+        await relay.send_message("web", "two", False, 0)       # added after it was shown
+        with pytest.raises(ControlError, match="has changed"):
+            await control.approve(request.id, messages=1)
+        assert relay.access.requests
+        clock.now += 31 * 60                                   # before any sweep
+        with pytest.raises(ControlError, match="no open request"):
+            await control.approve(request.id, messages=2)
+        assert not relay.access.grants
+    run(scenario())
+
+
+def test_a_refused_switch_keeps_the_request(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        grant = (await control.grant("web"))["grant"]
+        await relay.send_message("web", "sleep 30", False, 0)
+        await until_running(relay, "web")
+        await control.revoke(grant["id"])
+        await relay.send_message("web", "next", False, 0)
+        request = only_request(relay)
+        with pytest.raises(ControlError, match="still working"):
+            await control.approve(request.id, kind=HOST, full_access_ok=True, messages=1)
+        assert only_request(relay).id == request.id
+        await relay.stop("web")
+    run(scenario())
+
+
+def test_requests_take_a_limited_number_of_messages(setup):
+    async def scenario():
+        relay = Relay(setup)
+        for i in range(20):
+            await relay.send_message("web", f"m{i}", False, 0)
+        with pytest.raises(targets.RelayError, match="already wait"):
+            await relay.send_message("web", "one more", False, 0)
+    run(scenario())
+
+
+def test_without_a_control_interface_no_grant_counts(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await Control(relay).grant("web")
+        relay.access.suspended = "no control interface"
+        assert "locked" in await relay.send_message("web", "hi", False, 0)
+    run(scenario())
+
+
+@pytest.mark.parametrize("content", ["[]", '{"grants": [{"id": "x"}]}',
+                                      '{"grants": [{"id": "x", "target": "web", "kind": "container", '
+                                      '"created": 0, "expires": null, "idle": 1800, "last_used": 0, '
+                                      '"end_on_lock": false}]}'])
+def test_a_malformed_access_file_locks_everything(setup, content):
+    setup.state_dir.mkdir(parents=True, exist_ok=True)
+    (setup.state_dir / "access.json").write_text(content)
+    relay = Relay(setup)
+    assert not relay.access.grants
+    assert (setup.state_dir / "access.broken").exists()
+    assert "locked" in run(relay.send_message("web", "hi", False, 0))
+
+
+def test_state_files_are_private(setup):
+    run(Relay(setup).send_message("web", "hi", False, 0))
+    run(Control(Relay(setup)).grant("web"))
+    run(Relay(setup).send_message("web", "quick", False, 8))
+    for name in ("access.json", "state.json"):
+        assert (setup.state_dir / name).stat().st_mode & 0o777 == 0o600, name
+
+
+def test_old_state_without_places_keeps_host_projects_on_the_host(setup):
+    setup.state_dir.mkdir(parents=True, exist_ok=True)
+    (setup.state_dir / "state.json").write_text(json.dumps(
+        {"alpha": {"session_id": "s", "turn": None, "queue": []},
+         "web": {"session_id": "t", "turn": None, "queue": []}}))
+    relay = Relay(setup)
+    assert relay.conversations["alpha"].on_host
+    assert not relay.conversations["web"].on_host

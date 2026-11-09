@@ -40,6 +40,7 @@ UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 EXT_DIR=${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$UUID
 STAMP=$STATE_DIR/installed-pyproject.sha256
 STEP=""
+LOGS=$(mktemp -d /tmp/agent-relay-install.XXXX)
 CHANGED=()
 NOTES=()
 
@@ -72,6 +73,9 @@ ok "checkout: $SRC ($BRANCH at $COMMIT)"
 if [ -n "$(git -C "$SRC" status --porcelain --untracked-files=no)" ]; then
     note "The checkout has uncommitted changes; they are installed as they are."
 fi
+case "$SRC" in
+    */.worktrees/*) note "This is a worktree: the relay will run from it, and removing the worktree later breaks the relay. Usually install from the main checkout." ;;
+esac
 if [ "$BRANCH" != main ] && [ "$YES" = 0 ] && [ "$DRY" = 0 ]; then
     printf '    This installs from branch %s, not main. Continue? [y/N] ' "$BRANCH"
     read -r answer < /dev/tty || answer=""
@@ -121,12 +125,12 @@ else
     fi
     if [ "$DRY" = 1 ]; then
         printf '    would run: pipx install --force --editable %s\n' "$SRC[desktop]"
-    elif ! pipx install --force --editable "$SRC[desktop]" > /tmp/agent-relay-pipx.log 2>&1; then
+    elif ! pipx install --force --editable "$SRC[desktop]" > $LOGS/pipx.log 2>&1; then
         ok "pipx did not take the [desktop] extra; installing without it and adding dbus-fast"
-        pipx install --force --editable "$SRC" >> /tmp/agent-relay-pipx.log 2>&1 \
-            || fail "pipx install failed; see /tmp/agent-relay-pipx.log"
-        pipx inject agent-relay-mcp dbus-fast >> /tmp/agent-relay-pipx.log 2>&1 \
-            || fail "pipx inject dbus-fast failed; see /tmp/agent-relay-pipx.log"
+        pipx install --force --editable "$SRC" >> $LOGS/pipx.log 2>&1 \
+            || fail "pipx install failed; see $LOGS/pipx.log"
+        pipx inject agent-relay-mcp dbus-fast >> $LOGS/pipx.log 2>&1 \
+            || fail "pipx inject dbus-fast failed; see $LOGS/pipx.log"
     fi
     if [ "$DRY" = 0 ]; then
         "$VENV/bin/python" -c 'import dbus_fast, agent_relay_mcp.dbus_control' \
@@ -165,11 +169,11 @@ from agent_relay_mcp import config
 c = config.load(Path(sys.argv[1]))
 if not c.control_dbus:
     print('control_dbus is off: nothing can be approved on this computer')
-" "$CONFIG" > /tmp/agent-relay-config-check.txt 2>&1; then
-        cat /tmp/agent-relay-config-check.txt >&2
+" "$CONFIG" > $LOGS/config-check.txt 2>&1; then
+        cat $LOGS/config-check.txt >&2
         fail "$CONFIG has an error (above); the running relay was not restarted."
     fi
-    [ -s /tmp/agent-relay-config-check.txt ] && note "$(cat /tmp/agent-relay-config-check.txt)"
+    [ -s $LOGS/config-check.txt ] && note "$(cat $LOGS/config-check.txt)"
     ok "valid for this version"
 fi
 if [ -d "$STATE_DIR" ]; then

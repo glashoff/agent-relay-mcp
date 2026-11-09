@@ -148,7 +148,9 @@ class AccessDialog extends ModalDialog.ModalDialog {
             when_idle: true,
         };
         const call = this._request
-            ? this._client.approve({request: this._request.id, ...common})
+            ? this._client.approve({
+                request: this._request.id, messages: this._request.messages.length, ...common,
+            })
             : this._client.grant({
                 target: this._target,
                 include_host_projects: Boolean(this._includeHost?.checked),

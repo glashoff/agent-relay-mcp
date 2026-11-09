@@ -86,7 +86,8 @@ export function fillMenu(menu, ui) {
                 buttons.push(['Review…', () => ui.approveDialog(r)]);
             } else {
                 buttons.push(['Allow 1 h', () => ui.run(ui.client.approve(
-                    {request: r.id, minutes: 60, when_idle: true}), r.project)]);
+                    {request: r.id, minutes: 60, when_idle: true, messages: r.messages.length}),
+                r.project)]);
                 buttons.push(['Allow…', () => ui.approveDialog(r)]);
             }
             if (project?.dev_container && state.allow_host)

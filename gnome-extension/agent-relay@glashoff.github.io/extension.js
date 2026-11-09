@@ -321,7 +321,8 @@ export default class AgentRelayExtension extends Extension {
         const actions = full
             ? [['Review…', () => this._openDialog({request})]]
             : [['Allow 1 h', () => this._run(this._client.approve(
-                {request: request.id, minutes: 60, when_idle: true}), request.project)],
+                {request: request.id, minutes: 60, when_idle: true,
+                    messages: request.messages.length}), request.project)],
             ['Review…', () => this._openDialog({request})]];
         actions.push(['Deny', () => this._run(this._client.call('Deny', request.id),
             request.project)]);

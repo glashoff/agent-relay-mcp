@@ -34,17 +34,24 @@ class Target:
     workdir: str
 
 
+def usable_name(name: str) -> bool:
+    """Folder names that can be projects: not hidden, not "*" (which means all
+    projects in grants), nothing that is not plain printable text."""
+    return bool(name) and not name.startswith(".") and name != "*" and "/" not in name \
+        and name.isprintable()
+
+
 def list_projects(config: Config) -> list[Project]:
     root = config.projects_dir
     if not root.is_dir():
         raise RelayError(f"The projects directory {root} does not exist.")
     return [Project(p.name, p.resolve()) for p in sorted(root.iterdir(), key=lambda p: p.name.lower())
-            if p.is_dir() and not p.name.startswith(".")]
+            if p.is_dir() and usable_name(p.name)]
 
 
 def find_project(config: Config, name: str) -> Project:
     name = name.strip()
-    if not name or "/" in name or name.startswith("."):
+    if not usable_name(name):
         raise RelayError(f"Invalid project name: {name!r}")
     projects = list_projects(config)
     for project in projects:
@@ -85,7 +92,36 @@ def running_folders(config: Config) -> set[Path]:
     return {Path(line) for line in out.splitlines() if line.strip()}
 
 
+def may_start(config: Config, project: Project) -> None:
+    """Refuses to start a dev container whose configuration an earlier
+    container of the project could change: devcontainer.json decides what
+    runs on this machine at start (initializeCommand, mounts, runArgs), so a
+    container that can write it could escape at the next start."""
+    if config.start_writable_devcontainers:
+        return
+    out = _docker(config, "ps", "-aq", "--filter",
+                  f"label=devcontainer.local_folder={project.path}")
+    ids = out.split()
+    if not ids:
+        return              # never had a container: nothing could change it
+    protected = project.path / ".devcontainer"
+    if not (protected / "devcontainer.json").is_file():
+        protected = None    # .devcontainer.json in the project folder itself
+    for container_id in ids:
+        info = json.loads(_docker(config, "inspect", container_id))[0]
+        read_only = protected is not None and any(
+            Path(m.get("Source", "")) == protected and not m.get("RW", True)
+            for m in info.get("Mounts") or [])
+        if not read_only:
+            raise RelayError(
+                f"The dev container of {project.name} is stopped, and the relay does not "
+                "start it: its configuration (.devcontainer) can be changed from inside the "
+                "container, and starting it runs that configuration on this computer. Start "
+                "it yourself at the computer, or mount .devcontainer read-only in it.")
+
+
 def start_container(config: Config, project: Project) -> str:
+    may_start(config, project)
     command = [part.replace("{project}", str(project.path)) for part in config.start_command]
     try:
         result = subprocess.run(command, capture_output=True, text=True,
@@ -131,11 +167,15 @@ def target_for(config: Config, project: Project, *, start: bool,
     """Where Claude Code runs for project; None if its container is not running
     and start is off. on_host: on this machine even if it has a dev container
     (only ever set from a grant, see access.py)."""
-    if on_host or not project.has_devcontainer:
+    if on_host:
         if not config.allow_host_projects:
             raise RelayError(f"{project.name} cannot run on this machine: running "
                              "Claude Code outside a dev container is turned off.")
         return Target(project, None, None, str(project.path))
+    if not project.has_devcontainer:
+        # Never fall back to the host: that needs a grant with full access.
+        raise RelayError(f"{project.name} has no dev container (any more), so it cannot "
+                         "run in one; running it on this computer needs a new approval.")
     container_id = running_container(config, project)
     if not container_id:
         if not start:

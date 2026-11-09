@@ -51,12 +51,14 @@ class Control:
 
     async def approve(self, request_id: str, kind: str = "", minutes: int = 60, *,
                       end_on_lock: bool | None = None, full_access_ok: bool = False,
-                      when_idle: bool = False) -> dict:
+                      when_idle: bool = False, messages: int | None = None) -> dict:
+        """messages: how many messages the request had when it was shown; it
+        is refused if more have been added since."""
         if kind not in ("", CONTAINER, HOST):
             raise ControlError(f"Unknown kind {kind!r}: use {CONTAINER!r} or {HOST!r}.")
         return await self._call(self.relay.approve(
             request_id, kind or None, _seconds(minutes), end_on_lock=end_on_lock,
-            full_access_ok=full_access_ok, when_idle=when_idle))
+            full_access_ok=full_access_ok, when_idle=when_idle, messages=messages))
 
     async def deny(self, request_id: str) -> None:
         await self._call(self.relay.deny(request_id))

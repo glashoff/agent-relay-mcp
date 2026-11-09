@@ -29,7 +29,9 @@ HOST_WARNING = ("No dev container: Claude Code runs directly on this computer, a
                 "with full access to all files, credentials and programs.")
 ON_HOST_WARNING = ("Runs on this computer instead of its dev container: full access as "
                    "you, and the container's protections (read-only files, missing "
-                   "credentials, network limits) do not apply.")
+                   "credentials, network limits) do not apply. Files the container could "
+                   "change (project settings, hooks, scripts) then run with your rights.")
+MAX_MESSAGES = 20           # per waiting request
 
 
 class AccessError(Exception):
@@ -57,6 +59,11 @@ class Grant:
     last_used: float
     end_on_lock: bool
     include_host_projects: bool = False     # only for target ALL
+    # Where the project ran when the grant was given (CONTAINER or HOST). A
+    # grant stops covering a project that has gained or lost its dev container
+    # since: a container could otherwise delete its devcontainer.json and run
+    # on the host under a grant meant for the container.
+    natural: str = ""
 
     @property
     def full_access(self) -> bool:
@@ -101,6 +108,9 @@ class Access:
         self.requests: dict[str, Request] = {}
         self.switches: dict[str, Switch] = {}
         self.outcomes: dict[str, Outcome] = {}
+        # Set while no control interface runs: nothing can be revoked then,
+        # so no grant counts (fail closed).
+        self.suspended = ""
         self._load()
 
     # --- persistence -------------------------------------------------------
@@ -110,11 +120,21 @@ class Access:
             return
         try:
             raw = json.loads(self.path.read_text())
+            if not isinstance(raw, dict):
+                raise ValueError("not a JSON object")
             grants = {g["id"]: Grant(**g) for g in raw.get("grants", [])}
             requests = {r["id"]: Request(**r) for r in raw.get("requests", [])}
             switches = {s["project"]: Switch(**s) for s in raw.get("switches", [])}
             outcomes = {name: Outcome(**o) for name, o in raw.get("outcomes", {}).items()}
-        except (OSError, ValueError, TypeError, KeyError) as error:
+            for g in grants.values():
+                if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                           for v in (g.created, g.expires, g.idle, g.last_used)) \
+                        or g.kind not in (CONTAINER, HOST) or not isinstance(g.target, str):
+                    raise ValueError(f"grant {g.id} is malformed")
+            for r in requests.values():
+                if not isinstance(r.messages, list) or not isinstance(r.expires, (int, float)):
+                    raise ValueError(f"request {r.id} is malformed")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
             # Fail closed: everything is locked. Keep the file for a look.
             log.error("cannot read %s (%s); every project is locked", self.path, error)
             try:
@@ -147,8 +167,11 @@ class Access:
         it runs without being told otherwise). A grant for the project itself
         wins over one for all projects. idle_ok: count grants that are only
         idle as live (to keep them alive while a request runs)."""
+        if self.suspended:
+            return None
         own = [g for g in self.grants.values()
-               if g.target == project and self.live(g, now, idle_ok=idle_ok)]
+               if g.target == project and self.live(g, now, idle_ok=idle_ok)
+               and (not g.natural or g.natural == natural)]
         if own:
             return own[0]
         for g in self.grants.values():
@@ -184,7 +207,8 @@ class Access:
                       expires=now + self.cap(target, kind, natural, seconds,
                                              include_host_projects),
                       idle=self.limits.idle, last_used=now, end_on_lock=end_on_lock,
-                      include_host_projects=include_host_projects)
+                      include_host_projects=include_host_projects,
+                      natural="" if target == ALL else natural)
         for old in [g for g in self.grants.values() if g.target == target]:
             del self.grants[old.id]
         self.grants[grant.id] = grant
@@ -220,6 +244,9 @@ class Access:
         is new)."""
         for r in self.requests.values():
             if r.project == project:
+                if len(r.messages) + len(messages) > MAX_MESSAGES:
+                    raise AccessError(f"{MAX_MESSAGES} messages already wait for approval "
+                                      f"for {project}; wait until they are answered.")
                 r.messages += messages
                 return r, False
         if len(self.requests) >= self.limits.max_open_requests:
@@ -237,12 +264,26 @@ class Access:
     def open_request(self, project: str) -> Request | None:
         return next((r for r in self.requests.values() if r.project == project), None)
 
-    def take_request(self, request_id: str) -> Request:
-        r = self.requests.pop(request_id, None)
-        if not r:
+    def take_request(self, request_id: str, now: float | None = None,
+                     messages: int | None = None) -> Request:
+        """Removes and returns an open request, checked as in check_request."""
+        r = self.check_request(request_id, now, messages)
+        del self.requests[request_id]
+        self.outcomes.pop(r.project, None)
+        return r
+
+    def check_request(self, request_id: str, now: float | None = None,
+                      messages: int | None = None) -> Request:
+        """An open request. With now: refuses one that has expired. With
+        messages: refuses one that has changed since it was shown (more
+        messages were added)."""
+        r = self.requests.get(request_id)
+        if not r or (now is not None and now >= r.expires):
             raise AccessError(f"There is no open request {request_id}; it may have "
                               "expired or been answered already.")
-        self.outcomes.pop(r.project, None)
+        if messages is not None and messages != len(r.messages):
+            raise AccessError(f"Request {r.number} has changed since it was shown "
+                              f"({len(r.messages)} messages now); review it again.")
         return r
 
     def deny(self, request_id: str, now: float) -> Request:

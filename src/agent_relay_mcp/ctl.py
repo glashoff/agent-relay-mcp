@@ -232,7 +232,7 @@ async def command(args, client: Client) -> None:
             confirm(question, "yes")
         options = {"request": request["id"], "kind": "host" if args.on_host else "",
                    "minutes": args.minutes, "full_access_ok": full,
-                   "when_idle": args.when_idle}
+                   "when_idle": args.when_idle, "messages": len(request["messages"])}
         if args.end_on_lock is not None:
             options["end_on_lock"] = args.end_on_lock
         print(describe_grant(json.loads(await client.call("Approve", "s",

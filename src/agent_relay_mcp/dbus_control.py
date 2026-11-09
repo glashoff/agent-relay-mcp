@@ -95,7 +95,7 @@ METHODS = {
 GRANT_OPTIONS = {"target", "kind", "minutes", "end_on_lock", "include_host_projects",
                  "full_access_ok", "when_idle"}
 APPROVE_OPTIONS = {"request", "kind", "minutes", "end_on_lock", "full_access_ok",
-                   "when_idle"}
+                   "when_idle", "messages"}
 
 
 class NotAllowed(Exception):
@@ -151,6 +151,15 @@ class DBusControl:
             "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'"])
         self._spawn(self._forward_events())
         log.info("control interface on the session bus as %s", NAME)
+        # Locked while the relay was not running: end what ends on lock now.
+        try:
+            reply = await self.bus.call(Message(
+                destination="org.gnome.ScreenSaver", path="/org/gnome/ScreenSaver",
+                interface="org.gnome.ScreenSaver", member="GetActive"))
+            if reply.message_type == MessageType.METHOD_RETURN and reply.body == [True]:
+                await self._screen_locked()
+        except Exception as error:      # no GNOME here: nothing to check
+            log.debug("cannot ask whether the screen is locked: %s", error)
 
     def stop(self) -> None:
         for task in self.tasks:
