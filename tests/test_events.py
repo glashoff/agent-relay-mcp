@@ -27,6 +27,15 @@ def test_turn_output_follows_the_top_level_conversation_only():
     assert out.steps == ["Edit: /w/a.py"]
     assert out.last_text == "Checking."
     assert out.result == "All done" and not out.is_error
+    assert out.results == ["All done"]
+
+
+def test_turn_output_keeps_the_result_of_every_pass():
+    out = TurnOutput()
+    for text in ("First", "Second"):
+        out.feed(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                             "result": text, "session_id": "s1"}))
+    assert out.result == "Second" and out.results == ["First", "Second"]
 
 
 def test_error_results_carry_their_reason():

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_relay_mcp import relay as relay_module
 from agent_relay_mcp import targets
 from agent_relay_mcp.config import Config
 from agent_relay_mcp.relay import Relay
@@ -110,16 +111,118 @@ def test_follow_up_resumes_and_new_conversation_does_not(setup):
     run(scenario())
 
 
-def test_busy_project_refuses_a_second_message(setup):
+async def until_running(relay, project, seconds=10):
+    for _ in range(seconds * 20):
+        if relay.conversations[project].turn.phase == "running":
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{project} never ran")
+
+
+def test_a_message_sent_while_it_works_is_passed_in(setup):
     config, _ = setup
 
     async def scenario():
         relay = Relay(config)
         await relay.send_message("alpha", "sleep 3", False, 0)
-        await asyncio.sleep(0.5)
+        await until_running(relay, "alpha")
+        answer = await relay.send_message("alpha", "and more", False, 0)
+        assert "Passed the message directly into the request" in answer
+        assert "1 message(s) were passed in" in await relay.get_updates("alpha", 0)
+        report = await until_done(relay, "alpha")
+        assert "Done: sleep 3 + and more (new)" in report
+    run(scenario())
+
+
+def test_a_message_sent_while_it_starts_is_queued_then_passed_in(setup, monkeypatch):
+    config, _ = setup
+    monkeypatch.setattr(relay_module, "QUEUE_POLL_SECONDS", 0.2)
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "sleep 4", False, 0)
+        assert relay.conversations["alpha"].turn.phase == "starting"
+        answer = await relay.send_message("alpha", "later", False, 0)
+        assert "Queued the message" in answer and "still being started" in answer
+        assert "1 message(s) queued" in listed(await relay.list_projects(), "alpha")
+        report = await until_done(relay, "alpha")
+        assert "Done: sleep 4 + later (new)" in report
+        assert not relay.conversations["alpha"].queue
+    run(scenario())
+
+
+def test_a_message_for_an_ending_run_follows_as_the_next_request(setup, monkeypatch):
+    config, _ = setup
+    monkeypatch.setattr(relay_module, "QUEUE_POLL_SECONDS", 0.2)
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "sleep 2", False, 0)
+        await until_running(relay, "alpha")
+        first = relay.conversations["alpha"].turn
+        first.closed = True                 # as if it had stopped taking messages
+        answer = await relay.send_message("alpha", "one", False, 0)
+        assert "Queued the message" in answer and "follow-up request" in answer
+        assert "2 messages are queued" in await relay.send_message("alpha", "two", False, 0)
+        for _ in range(100):
+            if relay.conversations["alpha"].turn is not first:
+                break
+            await asyncio.sleep(0.1)
+        report = await until_done(relay, "alpha")
+        # The reply nobody picked up comes along with the next one.
+        assert "Reply to the request before" in report and "Done: sleep 2 (new)" in report
+        assert "Done: one\n\ntwo (resumed)" in report
+    run(scenario())
+
+
+def test_a_queue_survives_a_restart(setup, monkeypatch):
+    config, _ = setup
+    monkeypatch.setattr(relay_module, "QUEUE_POLL_SECONDS", 0.2)
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "sleep 2", False, 0)
+        await until_running(relay, "alpha")
+        relay.conversations["alpha"].turn.closed = True
+        await relay.send_message("alpha", "after", False, 0)
+        for task in list(relay.watchers.values()):
+            task.cancel()                   # the server goes down
+        restarted = Relay(config)
+        await restarted.get_updates("alpha", 0)     # takes up the queue
+        # Passed into the run, which still takes messages, or sent after it.
+        for _ in range(100):
+            report = await restarted.get_updates("alpha", 0)
+            if "Done: sleep 2 + after (new)" in report or "Done: after (resumed)" in report:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AssertionError("the queue was never sent")
+    run(scenario())
+
+
+def test_a_new_conversation_waits_for_the_running_one(setup):
+    config, _ = setup
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "sleep 3", False, 0)
         with pytest.raises(RelayError, match="still working"):
-            await relay.send_message("alpha", "more", False, 0)
+            await relay.send_message("alpha", "other", True, 0)
         await until_done(relay, "alpha")
+    run(scenario())
+
+
+def test_stop_drops_the_queue(setup):
+    config, _ = setup
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "sleep 30", False, 0)
+        await until_running(relay, "alpha")
+        relay.conversations["alpha"].turn.closed = True
+        await relay.send_message("alpha", "never", False, 0)
+        assert "1 queued message was dropped" in await relay.stop("alpha")
+        assert not relay.conversations["alpha"].queue
     run(scenario())
 
 

@@ -29,6 +29,9 @@ How to use it:
   complete and unambiguous, including what you already know from the
   conversation. Do not invent requirements.
 - send_message returns at once. Tell the user that Claude Code is working on it.
+- Additions and corrections for a request still in progress go through
+  send_message too. They are passed into the running request, or queued and
+  sent right after it; the reply says which. Tell the user.
   Do not call get_updates on your own in a loop; call it when the user asks
   how it is going, or when they come back to the topic.
 - Report results the way the user needs them. In a voice conversation, give a
@@ -62,6 +65,10 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         "Sends a message to Claude Code in a project: a new task, a follow-up, or the "
         "answer to a question Claude Code asked. Continues that project's conversation "
         "unless new_conversation is true. Starts the project's dev container if needed. "
+        "While Claude Code is working, the message is passed into the running request, "
+        "which takes it into account at its next step; if that is not possible, it is "
+        "queued and sent as the next request once the current one has finished. The "
+        "reply says which happened. "
         "Returns immediately by default; most requests take minutes, so tell the user it "
         "is in progress and fetch the result later with get_updates. Only for requests "
         f"that are obviously quick, set wait_seconds (at most {max_wait}) to wait for "

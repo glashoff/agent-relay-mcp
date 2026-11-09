@@ -38,6 +38,8 @@ class TurnOutput:
     steps: list[str] = field(default_factory=list)
     last_text: str = ""
     result: str | None = None
+    # One per pass: a message passed in after a pass has ended gets a pass of its own.
+    results: list[str] = field(default_factory=list)
     is_error: bool = False
     duration_ms: int = 0
     cost_usd: float | None = None
@@ -66,6 +68,7 @@ class TurnOutput:
             if self.is_error and not self.result:
                 errors = event.get("errors") or []
                 self.result = "; ".join(map(str, errors)) or str(event.get("subtype"))
+            self.results.append(self.result)
             self.duration_ms = int(event.get("duration_ms") or 0)
             self.cost_usd = event.get("total_cost_usd")
 

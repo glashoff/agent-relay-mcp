@@ -25,7 +25,7 @@ Four tools:
 | Tool | What it does |
 |---|---|
 | `list_projects` | The folders in your projects directory, with whether their container runs, Claude Code is working, or a reply is waiting |
-| `send_message(project, message, new_conversation=false, wait_seconds=0)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. Returns at once, unless `wait_seconds` is set |
+| `send_message(project, message, new_conversation=false, wait_seconds=0)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. While Claude Code works, the message is passed into the running request, or queued as the next one. Returns at once, unless `wait_seconds` is set |
 | `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps), or the final reply |
 | `stop(project)` | Ends the current request; the conversation is kept |
 
@@ -37,9 +37,20 @@ obviously quick.
 
 ## How it works
 
-- **One conversation per project.** Each message is one `claude -p` run with
-  `--output-format stream-json`; follow-ups continue the same session with
-  `--resume`.
+- **One conversation per project.** Each request is one `claude -p` run with
+  `--input-format stream-json --output-format stream-json`; follow-ups
+  continue the same session with `--resume`.
+- **Messages while it works.** A run reads its input from a FIFO in its run
+  directory, so a message sent while Claude Code works is passed into the
+  running request, and Claude Code takes it into account at its next step, as
+  when typing ahead in the IDE. A small shell loop next to the run closes the
+  FIFO once a result has come after the last message passed in, which ends
+  the run. A message that cannot be passed in (the container is still
+  starting, or the run is already ending) is queued and sent as the next
+  request in the same conversation as soon as the run has ended; a reply
+  nobody picked up in between is reported along with the next one. `stop`
+  drops the queue. Runs need `flock`, `timeout` and `mkfifo` in the container
+  (util-linux and coreutils).
 - **Runs are detached.** A run is started with `setsid` inside the container
   and writes to files under `~/.cache/agent-relay-mcp/<run>/` there. Restarting
   this server, a dropped tunnel or a phone that never asks again does not stop
