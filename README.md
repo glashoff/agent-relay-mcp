@@ -84,11 +84,9 @@ keeping the computer awake. It notifies about new requests (with allow and
 deny), grants about to end, and requests that start (with stop). It does not
 run on the lock screen; after unlocking it says what is waiting.
 
-```sh
-gnome-extension/install.sh       # copies it into ~/.local/share/gnome-shell/extensions
-# log out and in (Wayland), then:
-gnome-extensions enable agent-relay@glashoff.github.io
-```
+`scripts/install.sh` (below) copies it into
+`~/.local/share/gnome-shell/extensions` and enables it; it loads at the next
+login.
 
 `gnome-extension/test-in-headless-shell.sh` runs it in a headless GNOME Shell
 with a private session bus, its own folders and a throwaway relay, and leaves
@@ -145,6 +143,18 @@ off, or while anything is approved; and optionally also with the lid closed
   server (next section).
 
 ## Install
+
+On a laptop with this checkout, one script installs or updates everything,
+and can be run again after every update (it keeps the configuration, the
+relay's state and a changed systemd unit, and does no git operations):
+
+```sh
+scripts/install.sh               # relay (pipx, editable, [desktop]), service, GNOME extension
+scripts/install.sh --dry-run     # what it would do
+scripts/rollback.sh <commit>     # emergency: run an older version, leaving the checkout alone
+```
+
+By hand, or on a machine without this checkout:
 
 ```sh
 pipx install 'agent-relay-mcp[desktop] @ git+https://github.com/glashoff/agent-relay-mcp'
