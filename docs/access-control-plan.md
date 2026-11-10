@@ -62,7 +62,7 @@ that it can run there later without GNOME.
     with a clear message, while a request runs or messages wait there.
     Giving approvals stays at the laptop only.
 13. **The chat may ask for the host** (added 2026-11-10):
-    `send_message(..., run_on="host")` for a project with a dev container
+    `send_message(..., run_on_host=true)` for a project with a dev container
     does not run anything. Unless the project is already approved on the
     host, the message becomes a request of the kind "on the host" (in place
     of running, even under a grant for the dev container). The GNOME menu,
@@ -208,7 +208,7 @@ purpose (decision 8). This is a property of the grant, never of the request.
   preselected, "on the host" needs the extra confirmation) or with
   `agent-relay-ctl grant --on-host` (with the typed confirmation).
 - **Never chosen by Claude**: nothing in the text of a message changes it,
-  and the only parameter, `send_message(run_on="host")`, merely asks
+  and the only parameter, `send_message(run_on_host=true)`, merely asks
   (decision 13). The person approving decides the kind. "All projects"
   never includes the host kind.
 - **The warning** is that of host projects, plus what is lost: "Runs on this

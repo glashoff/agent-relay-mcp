@@ -5,7 +5,7 @@ import argparse
 import contextlib
 import logging
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -47,7 +47,7 @@ How to use it:
   match it at the laptop. Approvals cannot be given through this connector;
   never try to work around a locked project.
 - To run a project with a dev container directly on the computer instead, pass
-  run_on="host" to send_message, but only when the user asks for exactly that.
+  run_on_host=true to send_message, but only when the user asks for exactly that.
   It only asks: the user confirms it at the laptop, with a full-access warning.
 - When the user says they are done with a project (or with everything), end
   the approval with release_access. If Claude Code is still working there,
@@ -118,15 +118,16 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         wait_seconds: Annotated[int, Field(ge=0, le=60, description=(
             f"Seconds to wait for the reply before returning, at most {max_wait}. "
             "Default 0: return at once."))] = 0,
-        run_on: Annotated[Literal["", "host"], Field(description=(
-            "Only when the user explicitly asks for it: \"host\" asks to run a project "
-            "that has a dev container directly on the computer instead. This is only a "
+        run_on_host: Annotated[bool, Field(description=(
+            "Only when the user explicitly asks for it: true asks to run a project that "
+            "has a dev container directly on the computer instead. This is only a "
             "request: it waits for the user's confirmation at the laptop, with a "
-            "full-access warning, and nothing runs on the host before that. Leave empty "
-            "otherwise."))] = "",
+            "full-access warning, and nothing runs on the host before that."))] = False,
     ) -> str:
+        # A boolean, not a string with choices: claude.ai left that out of
+        # the tool's schema.
         return await guarded(relay.send_message(project, message, new_conversation,
-                                                wait_seconds, run_on))
+                                                wait_seconds, "host" if run_on_host else ""))
 
     @server.tool(description=(
         "Gets the state of the latest request to Claude Code in a project: still working "

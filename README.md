@@ -25,7 +25,7 @@ Five tools:
 | Tool | What it does |
 |---|---|
 | `list_projects` | The folders in your projects directory, with whether their container runs, Claude Code is working, a reply is waiting, and whether they are approved |
-| `send_message(project, message, new_conversation=false, wait_seconds=0, run_on="")` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. While Claude Code works, the message is passed into the running request, or queued as the next one. Returns at once, unless `wait_seconds` is set. `run_on="host"` only asks to run a project with a dev container on the host instead: it waits for approval with the full-access warning |
+| `send_message(project, message, new_conversation=false, wait_seconds=0, run_on_host=false)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. While Claude Code works, the message is passed into the running request, or queued as the next one. Returns at once, unless `wait_seconds` is set. `run_on_host=true` only asks to run a project with a dev container on the host instead: it waits for approval with the full-access warning |
 | `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps), or the final reply |
 | `stop(project)` | Ends the current request; the conversation is kept |
 | `release_access(project="", all_projects=false)` | Ends your approval for a project (or all) when you say you are done, so it is locked again; refused while Claude Code still works there. It can only take access away |
@@ -66,7 +66,7 @@ agent-relay-ctl watch                  # events as they come
   container and the host only while the other side is idle (`--when-idle`
   waits for that).
 - **Asking for the host**: the chat can ask to run a project with a dev
-  container on the host (`send_message(..., run_on="host")`). That only
+  container on the host (`send_message(..., run_on_host=true)`). That only
   makes a request shown as "asks to run ON THE HOST"; nothing runs on the
   host until you approve it with "full access" (or approve it for the dev
   container instead), and a grant for the dev container never becomes one
