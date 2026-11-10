@@ -56,8 +56,7 @@ agent-relay-ctl watch                  # events as they come
 
 - **Grants** cover one project or all projects with a dev container, and end
   after their time, after 30 minutes without a message or a running request,
-  and, if they say so, when the screen locks (the default for all projects
-  and for full access). Upper limits: 12 h for a project, 4 h for all
+  and, only if ticked for the grant, when the screen locks (off by default). Upper limits: 12 h for a project, 4 h for all
   projects, 2 h for full access.
 - **Full access**: projects without a dev container, and a project with one
   that you choose to run on the host instead (`--on-host`, with a

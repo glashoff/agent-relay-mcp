@@ -132,28 +132,57 @@ def process(pid: int, uid: int) -> Caller:
     return Caller(uid, program, tty != 0)
 
 
+RETRY_SECONDS = (1, 2, 5, 10, 30)     # waits between reconnection attempts
+
+
 class DBusControl:
-    def __init__(self, control: Control, *, check=may_grant):
+    """Keeps the control interface on the session bus, reconnecting when the
+    bus goes away (for example when the desktop session restarts it at a new
+    login). on_state(available, reason) is told whenever that changes: while
+    the interface is away nothing can be revoked, so no grant may count."""
+
+    def __init__(self, control: Control, *, check=may_grant,
+                 on_state=lambda available, reason: None):
         self.control = control
         self.check = check
+        self.on_state = on_state
         self.bus: MessageBus | None = None
         self.tasks: set[asyncio.Task] = set()
+        self._forwarder: asyncio.Task | None = None
 
     async def start(self) -> None:
-        self.bus = await MessageBus(bus_type=BusType.SESSION).connect()
-        self.bus.add_message_handler(self._handle)
-        reply = await self.bus.request_name(NAME, NameFlag.DO_NOT_QUEUE)
-        if reply != RequestNameReply.PRIMARY_OWNER:
-            self.bus.disconnect()
-            raise RuntimeError(f"{NAME} is already taken on the session bus: is another "
-                               "relay running?")
-        await self._bus_call("AddMatch", "s", [
-            "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'"])
-        self._spawn(self._forward_events())
-        log.info("control interface on the session bus as %s", NAME)
-        # Locked while the relay was not running: end what ends on lock now.
+        """Connects, or keeps trying in the background; never raises."""
         try:
-            reply = await self.bus.call(Message(
+            await self._connect()
+        except Exception as error:
+            log.error("cannot offer the control interface on the session bus (%s); every "
+                      "project stays locked until it can", error)
+            self.on_state(False, f"no control interface: {error}")
+        self._spawn(self._keep_connected())
+
+    async def _connect(self) -> None:
+        bus = await MessageBus(bus_type=BusType.SESSION).connect()
+        try:
+            bus.add_message_handler(self._handle)
+            reply = await bus.request_name(NAME, NameFlag.DO_NOT_QUEUE)
+            if reply != RequestNameReply.PRIMARY_OWNER:
+                raise RuntimeError(f"{NAME} is already taken on the session bus: is "
+                                   "another relay running?")
+            self.bus = bus
+            await self._bus_call("AddMatch", "s", [
+                "type='signal',interface='org.gnome.ScreenSaver',member='ActiveChanged'"])
+        except Exception:
+            self.bus = None
+            bus.disconnect()
+            raise
+        self._forwarder = asyncio.ensure_future(self._forward_events())
+        self.tasks.add(self._forwarder)
+        self._forwarder.add_done_callback(self.tasks.discard)
+        log.info("control interface on the session bus as %s", NAME)
+        self.on_state(True, "")
+        # Locked while the relay was away from the bus: end what ends on lock.
+        try:
+            reply = await bus.call(Message(
                 destination="org.gnome.ScreenSaver", path="/org/gnome/ScreenSaver",
                 interface="org.gnome.ScreenSaver", member="GetActive"))
             if reply.message_type == MessageType.METHOD_RETURN and reply.body == [True]:
@@ -161,8 +190,32 @@ class DBusControl:
         except Exception as error:      # no GNOME here: nothing to check
             log.debug("cannot ask whether the screen is locked: %s", error)
 
+    async def _keep_connected(self) -> None:
+        attempt = 0
+        while True:
+            if self.bus is not None:
+                try:
+                    await self.bus.wait_for_disconnect()
+                except Exception:
+                    pass
+                log.error("lost the session bus; every project stays locked until the "
+                          "control interface is back")
+                self.on_state(False, "control interface lost")
+                if self._forwarder:
+                    self._forwarder.cancel()
+                self.bus = None
+                attempt = 0
+            await asyncio.sleep(RETRY_SECONDS[min(attempt, len(RETRY_SECONDS) - 1)])
+            attempt += 1
+            try:
+                await self._connect()
+                attempt = 0
+            except Exception as error:
+                if attempt <= 3 or attempt % 20 == 0:
+                    log.warning("reconnecting to the session bus failed: %s", error)
+
     def stop(self) -> None:
-        for task in self.tasks:
+        for task in list(self.tasks):
             task.cancel()
         if self.bus:
             self.bus.disconnect()
@@ -182,8 +235,15 @@ class DBusControl:
 
     async def _forward_events(self) -> None:
         async for event in self.control.events():
-            self.bus.send(Message.new_signal(PATH, INTERFACE, "Event", "s",
-                                             [json.dumps(event)]))
+            bus = self.bus
+            if bus is None or not bus.connected:
+                return          # _keep_connected starts a new forwarder
+            try:
+                bus.send(Message.new_signal(PATH, INTERFACE, "Event", "s",
+                                            [json.dumps(event)]))
+            except Exception as error:
+                log.warning("cannot send an event on the session bus: %s", error)
+                return
 
     # --- incoming messages ------------------------------------------------------
 

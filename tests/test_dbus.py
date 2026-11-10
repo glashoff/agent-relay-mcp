@@ -57,7 +57,7 @@ def run(coro):
 
 async def service(config, check=lambda caller: True):
     relay = Relay(config)
-    bus = DBusControl(Control(relay), check=check)
+    bus = DBusControl(Control(relay), check=check, on_state=relay.set_control)
     await bus.start()
     return relay, bus
 
@@ -138,7 +138,7 @@ def test_screen_lock_ends_grants_that_say_so(config):
         relay, bus = await service(config)
         control = Control(relay)
         await control.grant("web", end_on_lock=False)
-        await control.grant("*")
+        await control.grant("*", end_on_lock=True)
         sender = await MessageBus().connect()
         sender.send(Message.new_signal("/org/gnome/ScreenSaver", "org.gnome.ScreenSaver",
                                        "ActiveChanged", "b", [True]))
@@ -175,8 +175,10 @@ def test_events_are_signals(config):
 def test_only_one_relay_owns_the_name(config):
     async def scenario():
         _, bus = await service(config)
-        with pytest.raises(RuntimeError, match="already taken"):
-            await service(config)
+        second, other = await service(config)
+        # The second one has no control interface, so nothing counts there.
+        assert "already taken" in second.access.suspended
+        other.stop()
         bus.stop()
     run(scenario())
 
@@ -264,3 +266,60 @@ def test_ctl_approves_a_host_request_on_the_host_with_full_access(config, monkey
         assert next(iter(relay.access.grants.values())).kind == "host"
         bus.stop()
     run(scenario())
+
+
+def test_losing_the_bus_locks_everything_until_it_is_back(tmp_path, monkeypatch):
+    """The session bus goes away (as at a new login) and comes back at the same
+    address: meanwhile no grant counts, afterwards the relay is back on it."""
+    from agent_relay_mcp import dbus_control
+    monkeypatch.setattr(dbus_control, "RETRY_SECONDS", (0.2,))
+    socket = tmp_path / "bus"
+    address = f"unix:path={socket}"
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", address)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(relay_module, "SWEEP_SECONDS", 3600)
+    (tmp_path / "projects/web/.devcontainer").mkdir(parents=True)
+    (tmp_path / "projects/web/.devcontainer/devcontainer.json").write_text("{}")
+    config = Config(projects_dir=tmp_path / "projects", allow_host_projects=True,
+                    claude_command=f"{sys.executable} {FAKE}", state_dir=tmp_path / "state")
+
+    def daemon():
+        process = subprocess.Popen(["dbus-daemon", "--session", "--nofork",
+                                    f"--address={address}", "--print-address=1"],
+                                   stdout=subprocess.PIPE, text=True)
+        process.stdout.readline()
+        return process
+
+    async def until(predicate):
+        for _ in range(100):
+            if predicate():
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError("never happened")
+
+    async def scenario():
+        first = daemon()
+        relay, bus = await service(config)
+        await Control(relay).grant("web")
+        assert not relay.access.suspended
+        first.terminate()
+        first.wait()
+        await until(lambda: relay.access.suspended)
+        assert "locked" in await relay.send_message("web", "hi", False, 0)
+        second = daemon()
+        try:
+            await until(lambda: not relay.access.suspended)
+            reply = await call("GetState")
+            assert json.loads(reply.body[0])["grants"]          # back, grants count
+        finally:
+            bus.stop()
+            second.terminate()
+            second.wait()
+    run(scenario())
+
+
+def test_the_relay_is_locked_until_the_control_interface_runs(config):
+    relay = Relay(config)
+    run(Control(relay).grant("web"))
+    relay.set_control(False, "the control interface is starting")
+    assert "locked" in run(relay.send_message("web", "hi", False, 0))

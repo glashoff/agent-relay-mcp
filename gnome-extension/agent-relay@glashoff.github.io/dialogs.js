@@ -133,7 +133,7 @@ class AccessDialog extends ModalDialog.ModalDialog {
     _sync() {
         const full = this._fullAccess;
         if (!this._lockTouched)
-            this._endOnLock.checked = full || this._all;
+            this._endOnLock.checked = false;
         const warning = this._onHost?.checked
             ? this._warnings.on_host : this._warnings.host_project;
         this._warning.text = full ? `Full access. ${warning}` : '';

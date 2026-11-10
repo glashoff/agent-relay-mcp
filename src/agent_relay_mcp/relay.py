@@ -755,6 +755,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
         else:
             warning = ""
         added = "" if new else " The message was added to the request already waiting."
+        if self.access.suspended:
+            added += (" Note: approvals cannot be given at the moment, because the relay "
+                      "has lost its connection to the desktop session; they work again "
+                      "once it is back.")
         return (f"{project.name} is locked{self._instance()}. The message waits for approval "
                 f"at the laptop: number {request.number}. Tell the user this number, so they "
                 "can match it there. Once approved, it runs automatically; ask with "
@@ -813,6 +817,16 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 continue        # whoever holds the lock reads it now
             try:
                 project = targets.find_project(self.config, name)
+            except RelayError:
+                # The folder is gone (moved or deleted): the run cannot be
+                # followed any more, so it is over for the relay.
+                turn.phase = FAILED
+                turn.error = "The project's folder is gone."
+                self._save()
+                log.warning("%s: the project folder is gone; its request counts as ended",
+                            key)
+                return
+            try:
                 async with lock:
                     await self._refresh(project, conversation)
             except RelayError as error:
@@ -869,6 +883,18 @@ kill -KILL -- "-$p" 2>/dev/null || true
             task = asyncio.create_task(self._drain(key))
             self.watchers[key] = task
             task.add_done_callback(lambda _: self.watchers.pop(key, None))
+
+    def set_control(self, available: bool, reason: str) -> None:
+        """Whether a control interface runs. Without one nothing can revoke a
+        grant, so no grant counts meanwhile; running requests finish."""
+        was = not self.access.suspended
+        self.access.suspended = "" if available else (reason or "no control interface")
+        if was != available:
+            log.log(logging.INFO if available else logging.ERROR,
+                    "control interface %s; grants %s", "available" if available else
+                    f"unavailable ({self.access.suspended})",
+                    "count again" if available else "do not count meanwhile")
+            self._emit("control", available=available, reason=self.access.suspended)
 
     def start_background(self) -> None:
         """Starts the sweeper and takes up queues; called once the server runs."""

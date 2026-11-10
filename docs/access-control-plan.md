@@ -51,8 +51,9 @@ that it can run there later without GNOME.
 9. **D-Bus** connects the relay with the GNOME extension and
    `agent-relay-ctl` on the laptop (section 3).
 10. **Defaults for host grants and keep-awake**: grants for host projects and
-    of the kind "on the host" last at most 2 h and end when the screen locks
-    (this can be switched off per grant); keep-awake is on while a request
+    of the kind "on the host" last at most 2 h; they do not end when the
+    screen locks unless that is ticked for the grant (changed 2026-11-10;
+    it was the default before); keep-awake is on while a request
     runs, without the lid inhibitor (the lid checkbox is off).
 11. **The menu and the notifications are in English**, like the rest of the
     relay.
@@ -189,7 +190,8 @@ by default and approved like any other project, but always with a warning.
   to it only by a separate checkbox "including host projects (full access)",
   off by default, with the same confirmation step.
 - **Shorter limits** (decision 10): for host projects the upper limit is
-  2 h instead of 12 h, and the grant ends when the screen locks by default.
+  2 h instead of 12 h; ending when the screen locks is offered, off by
+  default.
 - **This project itself** (`agent-relay-mcp`) is a host project. A grant for
   it lets Claude Code change the relay's source. With the fixed installation
   (section 8) that only takes effect when you install a new version, which is
@@ -218,8 +220,8 @@ purpose (decision 8). This is a property of the grant, never of the request.
   grants and requests), the extra confirmation step, notification titles,
   `agent-relay-ctl`, and the tool texts (`list_projects`: "on the host, full
   access"; the reply to `send_message` says the request runs on the host).
-- **Limits**: those of host projects (decision 10: 2 h, ends when the
-  screen locks by default).
+- **Limits**: those of host projects (decision 10: 2 h; ending when the
+  screen locks only if ticked).
 - **Where it runs**: in the project folder on the host, as the user, with the
   host's Claude Code, like a host project. The container is neither needed nor
   stopped.
@@ -344,8 +346,8 @@ a symlink into the repository.
 Grants do not all end when the screen locks: the main use is giving a grant
 and then walking away, and the screen locks a few minutes later. Instead:
 
-- Each grant has "ends when the screen locks"; default off for one project,
-  on for all projects.
+- Each grant has "ends when the screen locks"; it is off by default for
+  every kind of grant (changed 2026-11-10).
 - Upper limits and the idle limit always apply.
 - The relay notices the lock itself, through the D-Bus adapter
   (`org.gnome.ScreenSaver`, signal `ActiveChanged`), not through the
@@ -445,6 +447,13 @@ Fixed, each with a test:
   end at start if the screen is locked; scripts use private temp files, warn
   when installing from a worktree, and rollback.sh warns that versions
   without access control leave every project open.
+
+Found in use (2026-11-10): after a new login the session bus restarted;
+the relay lost its control interface without noticing and kept counting
+grants, although nothing could revoke them. Now the relay watches the bus:
+while the interface is away (also before it first comes up), no grant
+counts and messages become requests; it reconnects by itself (after 1, 2, 5,
+10, then every 30 s) and the grants count again with their own times.
 
 Remaining, by design or for later:
 

@@ -202,10 +202,9 @@ class Access:
                   include_host_projects: bool = False) -> Grant:
         """A new grant, replacing one the project already has. Callers check
         that the other kind is idle first (see Relay.grant)."""
-        full_access = kind == HOST or include_host_projects
         if end_on_lock is None:
-            # Host grants and grants for everything end with the screen lock.
-            end_on_lock = full_access or target == ALL
+            # No grant ends with the screen lock unless asked to.
+            end_on_lock = False
         grant = Grant(id=uuid.uuid4().hex[:12], target=target, kind=kind, created=now,
                       expires=now + self.cap(target, kind, natural, seconds,
                                              include_host_projects),

@@ -185,7 +185,7 @@ def test_grants_are_cut_to_their_upper_limits(setup):
         assert round(g["expires"] - g["idle_ends"] + 30 * 60) == 4 * hour
         g = (await control.grant("alpha", minutes=24 * 60, full_access_ok=True))["grant"]
         assert round(g["expires"] - g["idle_ends"] + 30 * 60) == 2 * hour
-        assert g["full_access"] and g["end_on_lock"]
+        assert g["full_access"] and not g["end_on_lock"]
     run(scenario())
 
 
@@ -289,11 +289,11 @@ def test_locking_the_screen_ends_the_grants_that_say_so(setup):
     async def scenario():
         relay = Relay(setup)
         control = Control(relay)
-        await control.grant("web", end_on_lock=False)
-        await control.grant(ALL)                 # ends on lock by default
-        await control.grant("alpha", full_access_ok=True)       # so does this
+        await control.grant("web", end_on_lock=True)
+        await control.grant(ALL)                 # no grant ends on lock by default
+        await control.grant("alpha", full_access_ok=True)
         await control.screen_locked()
-        assert [g.target for g in relay.access.grants.values()] == ["web"]
+        assert sorted(g.target for g in relay.access.grants.values()) == ["*", "alpha"]
     run(scenario())
 
 
@@ -764,4 +764,18 @@ def test_run_on_is_checked(setup):
         setup.allow_host_projects = False
         with pytest.raises(targets.RelayError, match="turned off"):
             await Relay(setup).send_message("web", "x", False, 0, run_on=HOST)
+    run(scenario())
+
+
+def test_full_access_grants_keep_running_when_the_screen_locks_unless_ticked(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        await control.grant("web", kind=HOST, full_access_ok=True, minutes=24 * 60)
+        await control.grant("alpha", full_access_ok=True, end_on_lock=True)
+        await control.screen_locked()
+        assert [(g.target, g.kind) for g in relay.access.grants.values()] == [("web", HOST)]
+        # The other limits stay: 2 h at most, 30 min idle.
+        (grant,) = relay.access.grants.values()
+        assert grant.expires - grant.created == 2 * 3600 and grant.idle == 30 * 60
     run(scenario())

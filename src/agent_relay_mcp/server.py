@@ -66,10 +66,11 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
 
     @contextlib.asynccontextmanager
     async def lifespan(_server):
+        # Until a control interface runs, nothing could revoke a grant, so
+        # none counts (fail closed); the interface lifts this when it is up.
+        relay.set_control(False, "the control interface is starting")
         bus = await start_dbus(config, relay)
         if bus is None:
-            # Nothing could revoke a grant now, so none counts (fail closed).
-            relay.access.suspended = "no control interface"
             logging.getLogger("agent_relay_mcp").error(
                 "without a control interface every project stays locked, also those "
                 "approved before")
@@ -175,13 +176,8 @@ async def start_dbus(config: config_module.Config, relay: Relay):
         log.error("dbus-fast is not installed (pip extra 'desktop'): nothing can be "
                   "approved, every project stays locked")
         return None
-    bus = DBusControl(Control(relay))
-    try:
-        await bus.start()
-    except Exception as error:
-        log.error("cannot offer the control interface on the session bus (%s): nothing can "
-                  "be approved, every project stays locked", error)
-        return None
+    bus = DBusControl(Control(relay), on_state=relay.set_control)
+    await bus.start()           # keeps trying, and reconnects when the bus goes away
     return bus
 
 
