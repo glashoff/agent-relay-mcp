@@ -182,3 +182,19 @@ def test_the_reply_header_goes_above_the_reply():
     assert turn.pending_start == 20
     out = relay._log_entry(turn, ("result", "All done.", False), 30)
     assert "· Reply**\nAll done.\n" in out and out.count("All done.") == 1
+
+
+def test_run_ended_is_only_sent_when_a_run_ends(setup):
+    config, folder = setup
+
+    async def scenario():
+        relay = Relay(config)
+        events = relay.subscribe()
+        await relay.send_message("alpha", "sleep 2", False, 0)
+        await until(lambda: relay.conversations["alpha"].turn.phase == "finished")
+        seen = []
+        while not events.empty():
+            seen.append(events.get_nowait())
+        ended = [e for e in seen if e["type"] == "run_ended"]
+        assert [e["phase"] for e in ended] == ["finished"]
+    run(scenario())

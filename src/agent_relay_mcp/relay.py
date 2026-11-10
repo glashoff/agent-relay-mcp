@@ -558,6 +558,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             conversation.session_id = turn.output.session_id
         if turn.phase != RUNNING or turn.logged != logged:
             self._save()        # also how far the log is, so a restart adds nothing twice
+        if turn.phase != RUNNING:
             self._emit("run_ended", project=project.name,
                        kind=self._kind_of(project, conversation), phase=turn.phase)
 
