@@ -56,6 +56,10 @@ class TurnOutput:
     is_error: bool = False
     duration_ms: int = 0
     cost_usd: float | None = None
+    # What came in, in order, for the project's log: ("step", summary),
+    # ("text", text), ("thinking", text), ("result", text, is_error). The
+    # reader takes them out (see Relay._poll).
+    items: list[tuple] = field(default_factory=list)
 
     def feed(self, line: str) -> None:
         """Takes one line of output. The output is written where the run is, so
@@ -79,10 +83,15 @@ class TurnOutput:
             for block in (event.get("message") or {}).get("content") or []:
                 if block.get("type") == "text" and block.get("text", "").strip():
                     self.last_text = block["text"].strip()
+                    self.items.append(("text", self.last_text))
+                elif block.get("type") == "thinking" and str(block.get("thinking") or "").strip():
+                    # Only with --thinking-display summarized; otherwise empty.
+                    self.items.append(("thinking", str(block["thinking"]).strip()))
                 elif block.get("type") == "tool_use":
                     self.steps.append(summarize_tool(block.get("name", "?"),
                                                      block.get("input") or {}))
                     del self.steps[:-MAX_STEPS]
+                    self.items.append(("step", self.steps[-1]))
         elif kind == "result":
             self.session_id = _uuid(event.get("session_id")) or self.session_id
             self.result = str(event.get("result") or "")
@@ -92,6 +101,7 @@ class TurnOutput:
                 self.result = "; ".join(map(str, errors)) or str(event.get("subtype"))
             self.results.append(self.result)
             del self.results[:-MAX_RESULTS]
+            self.items.append(("result", self.result, self.is_error))
             self.duration_ms = int(event.get("duration_ms") or 0)
             self.cost_usd = event.get("total_cost_usd")
 

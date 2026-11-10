@@ -78,6 +78,14 @@ class Config:
     # Start a stopped dev container even if an earlier container of the
     # project could write its .devcontainer (see targets.may_start).
     start_writable_devcontainers: bool = False
+    # A readable log of each project's conversation in its folder,
+    # .relay/log.md (ignored by git through .relay/.gitignore), written as
+    # Claude Code works, for following along in a Markdown preview.
+    project_log: bool = True
+    # How Claude Code reports its thinking (claude --thinking-display):
+    # "summarized" (short summaries, shown in the log), "omitted", or empty
+    # for Claude Code's default (no thinking text with -p).
+    thinking_display: str = "summarized"
 
 
 def load(path: Path | None = None) -> Config:
@@ -107,6 +115,9 @@ def load(path: Path | None = None) -> Config:
         raise SystemExit(f"{path}: path must start with /")
     if not 0 <= config.max_wait_seconds <= 60:
         raise SystemExit(f"{path}: max_wait_seconds must be between 0 and 60")
+    if config.thinking_display not in ("", "summarized", "omitted", "highlights"):
+        raise SystemExit(f"{path}: thinking_display must be summarized, omitted, "
+                         "highlights or empty")
     for key in ("grant_idle_minutes", "request_expiry_minutes", "max_grant_hours",
                 "max_all_grant_hours", "max_host_grant_hours"):
         if getattr(config, key) < 1:

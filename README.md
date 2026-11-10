@@ -99,6 +99,28 @@ from going to sleep by idling, through a systemd-logind inhibitor. Other modes:
 off, or while anything is approved; and optionally also with the lid closed
 (it gets warm in a bag). It lets go on battery below 20 %.
 
+### Following along
+
+The relay writes a readable log of each project's conversation into the
+project folder, `.relay/log.md`: what the chat sent (and messages passed in or
+queued, requests waiting for approval), Claude Code's steps, what it says in
+between, its thinking as short summaries, and the replies. It reads the
+output every two seconds while a request runs, so the log is current without
+anyone asking. Open the file in VS Code and use *Open Preview to the Side*
+(Ctrl+K V): the preview follows the file as it grows.
+
+- `.relay/.gitignore` (containing `*`) keeps it out of git, without changes to
+  the project's own `.gitignore`.
+- At the start of a request, a log over 1 MB moves to `.relay/log.1.md`
+  (replacing the one before); long texts are shortened.
+- It works the same for projects with a dev container (the folder is
+  mounted there, the relay writes it from outside) and for host projects.
+  The relay never follows a symlink in `.relay` and only appends to a regular
+  file, so a container cannot redirect it; HTML and images in Claude Code's
+  text are defused, so the preview loads nothing.
+- `project_log = false` turns it off; `thinking_display` controls whether
+  thinking summaries are there (`"summarized"`, the default).
+
 ## How it works
 
 - **One conversation per project.** Each request is one `claude -p` run with

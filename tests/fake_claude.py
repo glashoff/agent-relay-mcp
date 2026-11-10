@@ -41,6 +41,9 @@ message = inbox.get()
 if message is not None:
     emit({"type": "system", "subtype": "init", "session_id": session})
 while message is not None:
+    if "think" in message:
+        emit({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+            {"type": "thinking", "thinking": "Pondering the request.", "signature": "x"}]}})
     emit({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
         {"type": "text", "text": "Looking into it."},
         {"type": "tool_use", "name": "Bash", "input": {"command": "ls", "description": "List files"}}]}})

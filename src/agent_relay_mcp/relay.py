@@ -38,12 +38,15 @@ from .access import (ALL, CONTAINER, HOST, HOST_WARNING, ON_HOST_WARNING, Access
                      AccessError, Grant, Limits, Switch)
 from .config import Config
 from .events import TurnOutput, complete_lines
+from . import project_log
 from .keep_awake import KeepAwake
+from .project_log import ProjectLog
 from .targets import Project, RelayError, Target
 
 log = logging.getLogger("agent_relay_mcp")
 
 QUEUE_POLL_SECONDS = 2
+FOLLOW_SECONDS = 2         # how often a running request's output is read, for the log
 SWEEP_SECONDS = 10         # how often grants, requests and switches are checked
 
 RUN_ROOT = '"$HOME/.cache/agent-relay-mcp"'
@@ -73,6 +76,8 @@ class Turn:
     # The output is not stored in state.json. After a restart it is read again
     # from the run, but only when needed: a reply not yet reported.
     output_loaded: bool = True
+    logged: int = 0            # bytes of out.jsonl already in the project's log
+    last_logged: str = ""      # the last text written to the log
     closed: bool = False       # the run takes no more messages
     # The process id of the run, as seen at launch. The run directory is
     # writable where the run is, so its pid file is not trusted.
@@ -82,7 +87,8 @@ class Turn:
         return {"id": self.id, "message": self.message, "started": self.started,
                 "phase": self.phase, "error": self.error, "delivered": self.delivered,
                 "resumed": self.resumed, "born": self.born, "passed_in": self.passed_in,
-                "earlier_reply": self.earlier_reply, "pid": self.pid}
+                "earlier_reply": self.earlier_reply, "pid": self.pid,
+                "logged": self.logged}
 
 
 @dataclass
@@ -180,6 +186,8 @@ class Relay:
         self.locks: dict[str, asyncio.Lock] = {}
         self.background: set[asyncio.Task] = set()
         self.watchers: dict[str, asyncio.Task] = {}
+        self.followers: dict[str, asyncio.Task] = {}
+        self.logs: dict[str, ProjectLog] = {}
         self.sweeper: asyncio.Task | None = None
         self.subscribers: set[asyncio.Queue] = set()
         self.clock = time.time
@@ -342,6 +350,8 @@ class Relay:
             args += ["--model", c.model]
         if c.append_system_prompt:
             args += ["--append-system-prompt", c.append_system_prompt]
+        if c.thinking_display:
+            args += ["--thinking-display", c.thinking_display]
         args += ["--resume", session_id] if resume else ["--session-id", session_id]
         return args + c.extra_args
 
@@ -411,12 +421,20 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
         result = targets.run_in(self.config, target, script)
         status, _, data = result.stdout.partition(b"\n")
         status = status.decode(errors="replace").strip()
-        lines, used = complete_lines(data)
-        for line in lines:
-            turn.output.feed(line)
+        _, used = complete_lines(data)
+        position = turn.offset
+        entries = []
+        for raw in data[:used].split(b"\n")[:-1]:
+            position += len(raw) + 1
+            turn.output.feed(raw.decode("utf-8", errors="replace"))
+            items, turn.output.items = turn.output.items, []
+            if position > turn.logged:      # not in the log yet (also after a restart)
+                entries += [self._log_entry(turn, item) for item in items]
+        turn.logged = max(turn.logged, position)
         if not used and len(data) >= READ_LIMIT:
             used = len(data)        # one line longer than the limit: skip it
         turn.offset += used
+        was = turn.phase
         turn.output_loaded = True
         turn.born = turn.born or bool(turn.output.session_id)
         if status == "RUNNING":
@@ -433,6 +451,39 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
         else:
             turn.phase = FAILED
             turn.error = "Cannot read the run: " + result.stderr.decode(errors="replace")[-500:]
+        if turn.phase == FAILED and was in (STARTING, RUNNING):
+            entries.append(project_log.ended("failed", turn.error))
+        if entries:
+            self._write_log(target.project, "".join(entries))
+
+    def _log_entry(self, turn: Turn, item: tuple) -> str:
+        """Markdown for one thing the run produced."""
+        kind = item[0]
+        if kind == "step":
+            return project_log.step(item[1])
+        if kind == "thinking":
+            return project_log.thinking(item[1])
+        if kind == "text":
+            turn.last_logged = item[1]
+            return project_log.said(item[1])
+        text, is_error = item[1], item[2]
+        if text and text == turn.last_logged:
+            return project_log.reply("(the message above)", is_error)
+        return project_log.reply(text, is_error)
+
+    def _log_note(self, name: str, text: str) -> None:
+        try:
+            self._write_log(targets.find_project(self.config, name), project_log.note(text))
+        except RelayError:
+            pass
+
+    def _write_log(self, project: Project, text: str, *, new_request: bool = False) -> None:
+        if not self.config.project_log:
+            return
+        project_log_ = self.logs.get(project.name)
+        if project_log_ is None or project_log_.folder != project.path:
+            project_log_ = self.logs[project.name] = ProjectLog(project.path)
+        project_log_.write(text, new_request=new_request)
 
     def _stderr(self, target: Target, turn: Turn) -> str:
         result = targets.run_in(self.config, target, f'tail -c 1500 {_run_dir(turn.id)}/err.log')
@@ -462,6 +513,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
         if not turn or turn.phase not in (RUNNING,):
             return
         target = await asyncio.to_thread(self._target, project, conversation, start=False)
+        logged = turn.logged
         if target is None:
             turn.phase = FAILED
             turn.error = "The project's dev container is not running any more."
@@ -469,8 +521,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
             await asyncio.to_thread(self._poll, target, turn)
         if turn.output.session_id:
             conversation.session_id = turn.output.session_id
-        if turn.phase != RUNNING:
-            self._save()
+        if turn.phase != RUNNING or turn.logged != logged:
+            self._save()        # also how far the log is, so a restart adds nothing twice
             self._emit("run_ended", project=project.name,
                        kind=self._kind_of(project, conversation), phase=turn.phase)
 
@@ -650,6 +702,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
                    full_access=request.full_access)
         log.info("%s: %d message(s) wait for approval (number %d)", project.name,
                  len(messages), request.number)
+        self._write_log(project, project_log.waiting(request.number, messages,
+                                                     request.full_access))
         warning = (f" {project.name} has no dev container, so the approval at the laptop "
                    "warns that it runs with full access to the computer."
                    if request.full_access else "")
@@ -676,6 +730,9 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     earlier_reply=earlier_reply)
         conversation.turn = turn
         self._save()
+        self._write_log(project, project_log.request(
+            message, where=_where(self._kind_of(project, conversation)), continued=resume,
+            earlier=earlier_reply), new_request=True)
         self._update_keep_awake()
         self._emit("run_started", project=project.name,
                    kind=self._kind_of(project, conversation),
@@ -685,7 +742,38 @@ kill -KILL -- "-$p" 2>/dev/null || true
             self._start(project, conversation, turn, conversation.session_id, resume))
         self.background.add(task)
         task.add_done_callback(self.background.discard)
+        self._follow(_key(project, self._kind_of(project, conversation)))
         return turn, resume
+
+    def _follow(self, key: str) -> None:
+        """Reads the output of conversation key's running request as it comes,
+        so the project's log is current without anyone asking."""
+        if self.config.project_log and key not in self.followers:
+            task = asyncio.create_task(self._follow_run(key))
+            self.followers[key] = task
+            task.add_done_callback(lambda _: self.followers.pop(key, None))
+
+    async def _follow_run(self, key: str) -> None:
+        name = key.split("/")[0]
+        while True:
+            await asyncio.sleep(FOLLOW_SECONDS)
+            conversation = self.conversations.get(key)
+            turn = conversation.turn if conversation else None
+            if not turn or turn.phase not in (STARTING, RUNNING):
+                return
+            lock = self._lock(name)
+            if turn.phase == STARTING or lock.locked():
+                continue        # whoever holds the lock reads it now
+            try:
+                project = targets.find_project(self.config, name)
+                async with lock:
+                    await self._refresh(project, conversation)
+            except RelayError as error:
+                log.warning("following %s failed: %s", key, error)
+                return
+            except Exception:
+                log.exception("following %s failed", key)
+                return
 
     async def _add_to_running(self, project: Project, conversation: Conversation,
                               message: str, wait_seconds: int) -> str:
@@ -698,6 +786,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             if target and await asyncio.to_thread(self._pass_in, target, turn, message):
                 turn.passed_in.append(message)
                 self._save()
+                self._write_log(project, project_log.passed_in(message))
                 log.info("send_message %s: %d characters, passed into the running request",
                          project.name, len(message))
                 if wait_seconds > 0:
@@ -710,6 +799,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                         "next step. Ask for the result later with get_updates.")
         conversation.queue.append(message)
         self._save()
+        self._write_log(project, project_log.queued(message))
         self._watch(_key(project, self._kind_of(project, conversation)))
         log.info("send_message %s: %d characters, queued", project.name, len(message))
         if turn.phase == STARTING:
@@ -742,6 +832,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
         for key, conversation in self.conversations.items():
             if conversation.queue:
                 self._watch(key)
+            if conversation.turn and conversation.turn.phase in (STARTING, RUNNING):
+                self._follow(key)
         if self.sweeper is None or self.sweeper.done():
             self.sweeper = asyncio.create_task(self._sweep_forever())
 
@@ -799,6 +891,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                         if target and await asyncio.to_thread(self._pass_in, target, turn,
                                                               message):
                             turn.passed_in += conversation.queue
+                            self._write_log(project, project_log.passed_in(message))
                             conversation.queue = []
                             self._save()
                             log.info("%s: passed the queue into the running request", key)
@@ -929,6 +1022,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             if turn.phase == RUNNING or turn.output.result is None:
                 turn.phase = FAILED
                 turn.error = "Stopped on request."
+                self._write_log(project, project_log.ended("stopped", "Stopped on request."))
             turn.delivered = True
         dropped = len(conversation.queue)
         conversation.queue = []
@@ -1053,6 +1147,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
             grant = self._add_grant(project, params, now)
             self._emit("request_answered", request=request_id, project=project.name,
                        approved=True)
+            self._log_note(project.name, f"Request {request.number} was approved at the "
+                                         f"laptop, {_where(kind)}.")
             self._enqueue(project, kind, request.messages)
             return {"grant": self._grant_info(grant, now, seconds)}
 
@@ -1069,6 +1165,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
     async def deny(self, request_id: str) -> None:
         request = self.access.deny(request_id, self.clock())
         self.access.save()
+        self._log_note(request.project, f"Request {request.number} was denied at the laptop; "
+                                        "nothing was run.")
         self._emit("request_answered", request=request_id, project=request.project,
                    approved=False)
 
@@ -1203,6 +1301,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
             await self._after_grant_end(grant, False)
         for request in self.access.expired_requests(now):
             self.access.save()
+            self._log_note(request.project, f"Request {request.number} expired without an "
+                                            "answer; nothing was run.")
             self._emit("request_expired", request=request.id, project=request.project)
         for name, switch in list(self.access.switches.items()):
             project = projects.get(name)
