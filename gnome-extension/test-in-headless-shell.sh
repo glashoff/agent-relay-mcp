@@ -80,6 +80,8 @@ eval_js "Boolean(Main.panel.statusArea['$UUID'])"
 # A request to a locked project, through MCP like the chat would send it.
 mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"project":"web","message":"Please refactor the <b>parser</b> & add tests"}}}'
 mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send_message","arguments":{"project":"alpha","message":"Update the README"}}}'
+mkdir -p "$OUT/projects/shop/.devcontainer" && echo '{}' > "$OUT/projects/shop/.devcontainer/devcontainer.json"
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_message","arguments":{"project":"shop","message":"Run the deploy script","run_on":"host"}}}'
 sleep 2
 echo "notifications:"
 eval_js "Main.messageTray.getSources().flatMap(s => s.notifications.map(n => n.title + ' | ' + n.body + ' | ' + n.actions.map(a => a.label).join('/'))).join(' || ')"

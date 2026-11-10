@@ -321,11 +321,11 @@ def test_a_container_project_runs_on_the_host_only_by_a_host_grant(setup):
 
 
 def test_no_tool_can_choose_the_host():
-    # The tools take no parameter that could select where a project runs.
+    # Only send_message can name the host, and only to ask (run_on, tested below).
     for name in ("send_message", "get_updates", "stop", "list_projects"):
         parameters = set(inspect.signature(getattr(Relay, name)).parameters)
         assert parameters <= {"self", "project_name", "message", "new_conversation",
-                              "wait_seconds"}, name
+                              "wait_seconds", "run_on"}, name
     assert set(inspect.signature(Relay.release_access).parameters) == \
         {"self", "project_name", "all_projects"}
 
@@ -654,3 +654,114 @@ def test_old_state_without_places_keeps_host_projects_on_the_host(setup):
     relay = Relay(setup)
     assert relay.conversations["alpha"].on_host
     assert not relay.conversations["web"].on_host
+
+
+# --- asking to run on the host (send_message run_on="host") -------------------------
+
+def test_asking_for_the_host_makes_a_host_request_and_runs_nothing(setup):
+    async def scenario():
+        relay = Relay(setup)
+        answer = await relay.send_message("web", "do it on the host", False, 0, run_on=HOST)
+        request = only_request(relay)
+        assert request.kind == HOST and request.full_access
+        assert "on the host" in answer and "nothing runs on the host" in answer
+        assert not relay.conversations
+        state = Control(relay).state()
+        assert state["requests"][0]["kind"] == HOST
+    run(scenario())
+
+
+def test_a_container_grant_never_becomes_a_host_grant_by_asking(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await Control(relay).grant("web")
+        answer = await relay.send_message("web", "on the host please", False, 0, run_on=HOST)
+        assert "waits for approval" in answer
+        (grant,) = relay.access.grants.values()
+        assert grant.kind == "container"
+        assert not relay.conversations          # not run in the container either
+        # Plain messages still run in the dev container meanwhile.
+        await relay.send_message("web", "quick", False, 8)
+        assert set(relay.conversations) == {"web"}
+    run(scenario())
+
+
+def test_a_host_request_runs_on_the_host_only_with_the_confirmation(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        await relay.send_message("web", "on the host", False, 0, run_on=HOST)
+        request = only_request(relay)
+        with pytest.raises(ControlError, match="Needs confirmation"):
+            await control.approve(request.id, messages=1)
+        assert relay.access.requests and not relay.access.grants
+        result = await control.approve(request.id, full_access_ok=True, messages=1)
+        assert result["grant"]["kind"] == HOST
+        await until_done(relay, "web")
+        assert relay.conversations["web/host"].on_host
+        # Approved for the host: asking again simply runs there.
+        assert "on the host" in await relay.send_message("web", "more", False, 0,
+                                                         run_on=HOST)
+    run(scenario())
+
+
+def test_a_host_request_can_be_approved_for_the_dev_container_instead(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await relay.send_message("web", "on the host", False, 0, run_on=HOST)
+        result = await Control(relay).approve(only_request(relay).id, kind="container",
+                                              messages=1)
+        assert result["grant"]["kind"] == "container"
+        await until_done(relay, "web")
+        assert set(relay.conversations) == {"web"}
+    run(scenario())
+
+
+def test_a_host_request_follows_the_switch_rules(setup):
+    async def scenario():
+        relay = Relay(setup)
+        control = Control(relay)
+        await control.grant("web")
+        await relay.send_message("web", "sleep 30", False, 0)
+        await until_running(relay, "web")
+        await relay.send_message("web", "then on the host", False, 0, run_on=HOST)
+        request = only_request(relay)
+        with pytest.raises(ControlError, match="still working"):
+            await control.approve(request.id, full_access_ok=True, messages=1)
+        result = await control.approve(request.id, full_access_ok=True, messages=1,
+                                       when_idle=True)
+        assert result["switch"]["kind"] == HOST
+        assert relay.access.switches["web"].held == ["then on the host"]
+        # While the switch waits, asking for the host is held, not a new request.
+        assert "switching" in await relay.send_message("web", "x", False, 0, run_on=HOST)
+        await relay.stop("web")
+    run(scenario())
+
+
+def test_host_and_normal_requests_do_not_mix(setup):
+    async def scenario():
+        relay = Relay(setup)
+        await relay.send_message("web", "normal", False, 0)
+        with pytest.raises(targets.RelayError, match="has to be answered first"):
+            await relay.send_message("web", "host", False, 0, run_on=HOST)
+        await Control(relay).deny(only_request(relay).id)
+        await relay.send_message("web", "host", False, 0, run_on=HOST)
+        with pytest.raises(targets.RelayError, match="has to be answered first"):
+            await relay.send_message("web", "normal", False, 0)
+    run(scenario())
+
+
+def test_run_on_is_checked(setup):
+    async def scenario():
+        relay = Relay(setup)
+        with pytest.raises(targets.RelayError, match="run_on is"):
+            await relay.send_message("web", "x", False, 0, run_on="cloud")
+        with pytest.raises(targets.RelayError, match="no dev container"):
+            await relay.send_message("alpha", "x", False, 0, run_on="container")
+        # A host project already runs on the host: an ordinary request.
+        await relay.send_message("alpha", "x", False, 0, run_on=HOST)
+        assert only_request(relay).kind == ""
+        setup.allow_host_projects = False
+        with pytest.raises(targets.RelayError, match="turned off"):
+            await Relay(setup).send_message("web", "x", False, 0, run_on=HOST)
+    run(scenario())

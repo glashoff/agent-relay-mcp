@@ -43,8 +43,8 @@ that it can run there later without GNOME.
    with menu, notifications and keep-awake.
 8. **A project with a dev container can deliberately run on the host**, but
    only through a grant of its own kind, "on the host", given at the laptop
-   with the same warning as for host projects. Claude cannot choose it: no
-   tool has a parameter for it. Only one kind is active per project, never
+   with the same warning as for host projects. Claude cannot choose it; it can
+   only ask for it (decision 13). Only one kind is active per project, never
    both, and the kind can only change while the other one has nothing to do
    (no running request, nothing queued); otherwise the switch is refused or
    waits, with a clear message (section 4, "On the host").
@@ -61,6 +61,18 @@ that it can run there later without GNOME.
     only takes access away, so it is acceptable as a tool; it is refused,
     with a clear message, while a request runs or messages wait there.
     Giving approvals stays at the laptop only.
+13. **The chat may ask for the host** (added 2026-11-10):
+    `send_message(..., run_on="host")` for a project with a dev container
+    does not run anything. Unless the project is already approved on the
+    host, the message becomes a request of the kind "on the host" (in place
+    of running, even under a grant for the dev container). The GNOME menu,
+    the notification and `agent-relay-ctl` show it as "asks to run ON THE
+    HOST" with the full-access warning, and approving it needs the
+    full-access confirmation; it can also be approved for the dev container
+    instead. A grant for the dev container never turns into one for the host
+    this way, and the switch rules apply (only while the other side is idle).
+    One waiting request per project, so a request for the host and an
+    ordinary one do not mix.
 
 ## 2. Threat model
 
@@ -195,10 +207,10 @@ purpose (decision 8). This is a property of the grant, never of the request.
   a choice when allowing an open request: "in the dev container" is
   preselected, "on the host" needs the extra confirmation) or with
   `agent-relay-ctl grant --on-host` (with the typed confirmation).
-- **Never chosen by Claude**: no MCP tool gets a parameter for it, and
-  nothing in the text of a message changes it. A request carries no kind;
-  only the person approving it adds one. "All projects" never includes the
-  host kind.
+- **Never chosen by Claude**: nothing in the text of a message changes it,
+  and the only parameter, `send_message(run_on="host")`, merely asks
+  (decision 13). The person approving decides the kind. "All projects"
+  never includes the host kind.
 - **The warning** is that of host projects, plus what is lost: "Runs on this
   computer instead of its dev container: full access as you, and the
   container's protections (read-only files, missing credentials, network

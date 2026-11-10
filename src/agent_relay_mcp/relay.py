@@ -630,11 +630,23 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 "the laptop):\n" + "\n".join(lines))
 
     async def send_message(self, project_name: str, message: str,
-                           new_conversation: bool, wait_seconds: int) -> str:
+                           new_conversation: bool, wait_seconds: int,
+                           run_on: str = "") -> str:
+        """run_on="host" asks to run a project with a dev container on the host
+        instead. It is only a request: it never changes a grant, and nothing
+        runs on the host before it is approved at the laptop."""
         project = targets.find_project(self.config, project_name)
         message = message.strip()
         if not message:
             raise RelayError("The message is empty.")
+        if run_on not in ("", CONTAINER, HOST):
+            raise RelayError(f"run_on is {CONTAINER!r}, {HOST!r} or empty, not {run_on!r}.")
+        if run_on == CONTAINER and not project.has_devcontainer:
+            raise RelayError(f"{project.name} has no dev container.")
+        if run_on == HOST and not self.config.allow_host_projects:
+            raise RelayError("Running Claude Code outside a dev container is turned off "
+                             "on this computer.")
+        want_host = run_on == HOST and project.has_devcontainer
         if not project.has_devcontainer and not self.config.allow_host_projects:
             raise RelayError(f"{project.name} has no dev container, and running "
                              "Claude Code outside one is turned off.")
@@ -643,6 +655,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
             await self._refresh_all(project)
             now = self.clock()
             route, grant, kind = self._route(project, now)
+            if want_host and not (route in ("go", "hold") and kind == HOST):
+                # Not approved to run on the host (locked, approved for the dev
+                # container, or switching): ask, whatever is approved now.
+                return self._ask(project, [message], now, kind=HOST)
             if route == "locked":
                 return self._ask(project, [message], now)
             if route == "hold":
@@ -689,24 +705,34 @@ kill -KILL -- "-$p" 2>/dev/null || true
         return (f"{what} with Claude Code in {project.name}. It is working on it."
                 f"{start_note} Ask for the result later with get_updates.")
 
-    def _ask(self, project: Project, messages: list[str], now: float) -> str:
-        """Turns messages for a project no grant covers into a request."""
+    def _ask(self, project: Project, messages: list[str], now: float,
+             kind: str = "") -> str:
+        """Turns messages for a project no grant covers into a request (kind
+        HOST: a request to run it on the host)."""
         try:
-            request, new = self.access.request(project.name, messages, now,
-                                               full_access=not project.has_devcontainer)
+            request, new = self.access.request(
+                project.name, messages, now, kind=kind,
+                full_access=kind == HOST or not project.has_devcontainer)
         except AccessError as error:
             raise RelayError(str(error)) from error
         self.access.save()
         self._emit("request_added" if new else "request_updated", project=project.name,
                    request=request.id, number=request.number,
-                   full_access=request.full_access)
+                   full_access=request.full_access, kind=request.kind)
         log.info("%s: %d message(s) wait for approval (number %d)", project.name,
                  len(messages), request.number)
         self._write_log(project, project_log.waiting(request.number, messages,
-                                                     request.full_access))
-        warning = (f" {project.name} has no dev container, so the approval at the laptop "
-                   "warns that it runs with full access to the computer."
-                   if request.full_access else "")
+                                                     request.full_access,
+                                                     on_host=request.kind == HOST))
+        if request.kind == HOST:
+            warning = (f" It asks to run {project.name} on the host instead of its dev "
+                       "container; the approval at the laptop warns that this means full "
+                       "access to the computer, and nothing runs on the host before it.")
+        elif request.full_access:
+            warning = (f" {project.name} has no dev container, so the approval at the laptop "
+                       "warns that it runs with full access to the computer.")
+        else:
+            warning = ""
         added = "" if new else " The message was added to the request already waiting."
         return (f"{project.name} is locked{self._instance()}. The message waits for approval "
                 f"at the laptop: number {request.number}. Tell the user this number, so they "
@@ -1127,7 +1153,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             raise AccessError(f"There is no open request {request_id}; it may have "
                               "expired or been answered already.")
         project = self._project(request.project)
-        kind = kind or natural(project)
+        kind = kind or request.kind or natural(project)
         self._check_kind(project, kind, False, full_access_ok)
         params = {"target": project.name, "kind": kind, "seconds": seconds,
                   "end_on_lock": end_on_lock}
@@ -1435,7 +1461,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             "requests": [{"id": r.id, "project": r.project, "number": r.number,
                           "messages": [m[:2000] for m in r.messages],
                           "created": r.created, "expires": r.expires,
-                          "full_access": r.full_access}
+                          "full_access": r.full_access, "kind": r.kind}
                          for r in self.access.requests.values()],
             "switches": [{"project": s.project, "kind": s.kind, "requested": s.requested,
                           "expires": s.expires, "held": len(s.held)}

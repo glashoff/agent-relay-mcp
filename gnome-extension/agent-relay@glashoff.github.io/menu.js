@@ -76,13 +76,19 @@ export function fillMenu(menu, ui) {
         for (const r of state.requests) {
             const project = state.projects.find(p => p.name === r.project);
             const rows = [[`Number ${r.number}: ${r.project}, ${duration(now - r.created)} ago`, '']];
-            if (r.full_access)
+            const asksHost = r.kind === 'host';
+            if (asksHost)
+                rows.push(['Asks to run ON THE HOST instead of its dev container: full access to this computer', 'agent-relay-warning']);
+            else if (r.full_access)
                 rows.push(['No dev container: full access to this computer', 'agent-relay-warning']);
             for (const m of r.messages)
                 rows.push([`“${oneLine(m, 200)}”`, 'agent-relay-message']);
             rows.push([`Expires in ${duration(r.expires - now)}`, 'agent-relay-dim']);
             const buttons = [];
-            if (r.full_access) {
+            if (asksHost) {
+                buttons.push(['Review on the host…', () => ui.approveDialog(r, 'host')]);
+                buttons.push(['In the dev container…', () => ui.approveDialog(r)]);
+            } else if (r.full_access) {
                 buttons.push(['Review…', () => ui.approveDialog(r)]);
             } else {
                 buttons.push(['Allow 1 h', () => ui.run(ui.client.approve(
@@ -90,7 +96,7 @@ export function fillMenu(menu, ui) {
                 r.project)]);
                 buttons.push(['Allow…', () => ui.approveDialog(r)]);
             }
-            if (project?.dev_container && state.allow_host)
+            if (project?.dev_container && state.allow_host && !asksHost)
                 buttons.push(['On the host…', () => ui.approveDialog(r, 'host')]);
             buttons.push(['Deny', () => ui.run(ui.client.call('Deny', r.id), r.project)]);
             menu.addMenuItem(block(rows, buttons));

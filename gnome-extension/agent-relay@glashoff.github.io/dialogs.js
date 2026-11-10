@@ -47,7 +47,9 @@ class AccessDialog extends ModalDialog.ModalDialog {
         let title, description;
         if (request) {
             title = `Approve request ${request.number}`;
-            description = `${request.project} asks to run:`;
+            description = request.kind === 'host'
+                ? `${request.project} asks to run ON THE HOST, instead of its dev container:`
+                : `${request.project} asks to run:`;
         } else if (this._all) {
             title = 'Grant all projects';
             description = 'Every project with a dev container, run in its dev container.';

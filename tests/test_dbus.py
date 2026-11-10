@@ -246,3 +246,21 @@ def test_durations():
     for bad in ("", "0", "abc", "1d"):
         with pytest.raises(Exception):
             ctl.minutes(bad)
+
+
+def test_ctl_approves_a_host_request_on_the_host_with_full_access(config, monkeypatch, capsys):
+    asked = []
+    monkeypatch.setattr(ctl, "confirm", lambda question, answer: asked.append((question, answer)))
+
+    async def scenario():
+        relay, bus = await service(config)
+        await relay.send_message("web", "on the host", False, 0, run_on="host")
+        await ctl_run([])
+        assert "asks to run ON THE HOST" in capsys.readouterr().out
+        number = next(iter(relay.access.requests.values())).number
+        await ctl_run(["approve", str(number)])
+        question, answer = asked[-1]
+        assert answer == "full access" and "on the host" in question
+        assert next(iter(relay.access.grants.values())).kind == "host"
+        bus.stop()
+    run(scenario())

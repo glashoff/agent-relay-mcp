@@ -134,8 +134,11 @@ def queued(message: str) -> str:
     return f"### {clock()} · Message queued (follows as soon as possible)\n\n{quoted(message)}\n\n"
 
 
-def waiting(number: int, messages: list[str], full_access: bool) -> str:
-    warning = " · no dev container: full access" if full_access else ""
+def waiting(number: int, messages: list[str], full_access: bool, on_host: bool = False) -> str:
+    if on_host:
+        warning = " · asks to run on the host: full access"
+    else:
+        warning = " · no dev container: full access" if full_access else ""
     body = "\n\n".join(quoted(m) for m in messages)
     return (f"\n---\n\n## {clock()} · Waiting for approval at the laptop "
             f"(number {number}){warning}\n\n{body}\n\n")

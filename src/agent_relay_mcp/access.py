@@ -78,7 +78,10 @@ class Request:
     messages: list[str]
     created: float
     expires: float
-    full_access: bool           # the project has no dev container
+    full_access: bool           # it would run on the host, as the user
+    # Where the chat asked it to run: "" (where the project runs), or HOST
+    # for a project with a dev container. Only a wish; the approval decides.
+    kind: str = ""
 
 
 @dataclass
@@ -239,11 +242,16 @@ class Access:
     # --- requests ------------------------------------------------------------
 
     def request(self, project: str, messages: list[str], now: float, *,
-                full_access: bool) -> tuple[Request, bool]:
+                full_access: bool, kind: str = "") -> tuple[Request, bool]:
         """The open request of project with messages added: (request, whether it
-        is new)."""
+        is new). kind: where the chat asks it to run (see Request.kind)."""
         for r in self.requests.values():
             if r.project == project:
+                if r.kind != kind:
+                    where = "on the host" if r.kind == HOST else "where it normally runs"
+                    raise AccessError(
+                        f"A request to run {project} {where} (number {r.number}) already "
+                        "waits for approval at the laptop; it has to be answered first.")
                 if len(r.messages) + len(messages) > MAX_MESSAGES:
                     raise AccessError(f"{MAX_MESSAGES} messages already wait for approval "
                                       f"for {project}; wait until they are answered.")
@@ -256,7 +264,8 @@ class Access:
         number = random.choice([n for n in range(10, 100) if n not in taken])
         r = Request(id=uuid.uuid4().hex[:12], project=project, number=number,
                     messages=list(messages), created=now,
-                    expires=now + self.limits.request_expiry, full_access=full_access)
+                    expires=now + self.limits.request_expiry, full_access=full_access,
+                    kind=kind)
         self.requests[r.id] = r
         self.outcomes.pop(project, None)
         return r, True

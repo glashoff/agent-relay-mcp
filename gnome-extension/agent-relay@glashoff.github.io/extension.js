@@ -314,12 +314,17 @@ export default class AgentRelayExtension extends Extension {
         if (!request)
             return;
         const full = request.full_access;
-        const title = full
-            ? `Approve ${request.project}? Number ${request.number}, FULL ACCESS`
-            : `Approve ${request.project}? Number ${request.number}`;
-        const body = request.messages.map(m => oneLine(m, 200)).join(' / ');
+        const asksHost = request.kind === 'host';
+        let title = `Approve ${request.project}? Number ${request.number}`;
+        if (asksHost)
+            title = `Run ${request.project} ON THE HOST? Number ${request.number}, FULL ACCESS`;
+        else if (full)
+            title += ', FULL ACCESS';
+        let body = request.messages.map(m => oneLine(m, 200)).join(' / ');
+        if (asksHost)
+            body = `Asks to run on this computer instead of its dev container. ${body}`;
         const actions = full
-            ? [['Review…', () => this._openDialog({request})]]
+            ? [['Review…', () => this._openDialog({request, kind: asksHost ? 'host' : ''})]]
             : [['Allow 1 h', () => this._run(this._client.approve(
                 {request: request.id, minutes: 60, when_idle: true,
                     messages: request.messages.length}), request.project)],

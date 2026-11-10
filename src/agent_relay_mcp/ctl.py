@@ -121,7 +121,10 @@ def show_state(state: dict) -> None:
     requests = state["requests"]
     print("\nWaiting for approval:" if requests else "\nWaiting for approval: nothing.")
     for r in requests:
-        warning = "  [no dev container: FULL ACCESS]" if r["full_access"] else ""
+        if r.get("kind") == "host":
+            warning = "  [asks to run ON THE HOST: FULL ACCESS]"
+        else:
+            warning = "  [no dev container: FULL ACCESS]" if r["full_access"] else ""
         print(f"  number {r['number']}  {r['project']}, {until(now - r['created'])} ago, "
               f"expires in {until(r['expires'] - now)}{warning}")
         for message in r["messages"]:
@@ -220,17 +223,23 @@ async def command(args, client: Client) -> None:
     if args.command == "approve":
         request = await find_request(client, args.request)
         state = await client.state()
-        full = args.on_host or request["full_access"]
-        warning = state["warnings"]["on_host" if args.on_host else "host_project"]
+        container = any(p["name"] == request["project"] and p["dev_container"]
+                        for p in state["projects"])
+        # A request that asks for the host runs there unless --in-container.
+        on_host = container and not args.in_container and (
+            args.on_host or request.get("kind") == "host")
+        kind = "host" if on_host else ("container" if container else "")
+        full = on_host or not container
+        warning = state["warnings"]["on_host" if on_host else "host_project"]
         messages = "\n".join("  > " + " ".join(m.split())[:300] for m in request["messages"])
-        where = " on the host" if args.on_host else ""
+        where = " on the host" if on_host else (" in its dev container" if container else "")
         question = (f"Approve number {request['number']} for {request['project']}{where}, "
                     f"granting it for {until(args.minutes * 60)}?\n{messages}")
         if full:
             confirm(f"{question}\nWARNING: {warning}", "full access")
         else:
             confirm(question, "yes")
-        options = {"request": request["id"], "kind": "host" if args.on_host else "",
+        options = {"request": request["id"], "kind": kind,
                    "minutes": args.minutes, "full_access_ok": full,
                    "when_idle": args.when_idle, "messages": len(request["messages"])}
         if args.end_on_lock is not None:
@@ -329,7 +338,11 @@ def parser() -> argparse.ArgumentParser:
     a = sub.add_parser("approve", help="approve a waiting request")
     a.add_argument("request", help="its number (or id)")
     a.add_argument("--for", dest="minutes", type=minutes, default=60)
-    a.add_argument("--on-host", action="store_true")
+    g2 = a.add_mutually_exclusive_group()
+    g2.add_argument("--on-host", action="store_true",
+                    help="run it on the host (the default for requests that ask for it)")
+    g2.add_argument("--in-container", action="store_true",
+                    help="run it in its dev container, although it asks for the host")
     a.add_argument("--when-idle", action="store_true")
     lock_options(a)
 
