@@ -149,7 +149,11 @@ anyone asking. Open the file in VS Code and use *Open Preview to the Side*
   this server, a dropped tunnel or a phone that never asks again does not stop
   it; the server keeps only the ids (in `~/.local/state/agent-relay-mcp/`) and
   reads the output again when asked. Run directories older than 7 days are
-  removed.
+  removed. A run on this machine (a project without a dev container, or one
+  approved to run on the host) is started in a systemd scope of its own
+  (`systemd-run --user --scope`) when the relay runs as a systemd service;
+  otherwise it would belong to the service, and restarting the relay would
+  end it (`host_run_scope`).
 - **Containers are found, not configured.** A project's container is the one
   with the label `devcontainer.local_folder=<project path>`, which the dev
   container CLI sets. Commands run as the container's `remoteUser` (from its

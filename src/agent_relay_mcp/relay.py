@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -115,6 +116,7 @@ class Conversation:
 # message in and closing exclusive.
 _RUNNER = """
 d=$0
+echo $$ > "$d/pid"
 "$@" < "$d/in" > "$d/out.jsonl" 2> "$d/err.log" &
 c=$!
 exec 3> "$d/in"
@@ -373,9 +375,10 @@ mkdir -p "$d"
 cat > "$d/prompt"
 mkfifo "$d/in"
 echo 0 > "$d/mark"
-setsid sh -c {shlex.quote(_RUNNER)} "$d" {claude} < /dev/null > /dev/null 2>&1 &
-echo $! > "$d/pid"
-echo "PID $!"
+{self._scope(target, turn)}setsid sh -c {shlex.quote(_RUNNER)} "$d" {claude} < /dev/null > /dev/null 2>&1 &
+# The runner writes its own pid: setsid, or the scope, may have forked.
+for i in $(seq 1 100); do [ -s "$d/pid" ] && break; sleep 0.05; done
+echo "PID $(cat "$d/pid" 2>/dev/null)"
 """
         result = targets.run_in(self.config, target, script, stdin=_user_message(turn.message))
         if result.returncode != 0:
@@ -384,6 +387,17 @@ echo "PID $!"
         for line in result.stdout.decode(errors="replace").splitlines():
             if line.startswith("PID ") and line[4:].strip().isdigit():
                 turn.pid = int(line[4:].strip())
+
+    def _scope(self, target: Target, turn: Turn) -> str:
+        """For a run on this machine while the relay runs as a systemd
+        service: a prefix that starts it in a scope of its own. Otherwise it
+        would be part of the service, and restarting the relay would end it
+        (container runs live in their container and are not affected)."""
+        if target.container_id or not self.config.host_run_scope \
+                or not os.environ.get("INVOCATION_ID") or not shutil.which("systemd-run"):
+            return ""
+        return (f"systemd-run --user --scope --quiet --collect "
+                f"--unit=agent-relay-run-{turn.id} -- ")
 
     def _pass_in(self, target: Target, turn: Turn, message: str) -> bool:
         """Passes message into the running run; False if it takes none any more

@@ -114,3 +114,33 @@ def test_old_runs_files_are_not_trusted_for_kill(setup):
     shell = relay_module._pid(Turn(str(uuid.uuid4()), "x", 0))
     assert '0|1) p=""' in shell
     assert relay_module._pid(Turn(str(uuid.uuid4()), "x", 0, pid=4242)) == "p=4242"
+
+
+def test_host_runs_get_a_scope_of_their_own_under_systemd(setup, monkeypatch):
+    config, target, _ = setup
+    relay = Relay(config)
+    turn = Turn(str(uuid.uuid4()), "x", 0)
+    monkeypatch.setattr(relay_module.shutil, "which", lambda name: "/usr/bin/" + name)
+    assert relay._scope(target, turn) == ""                 # not a systemd service
+    monkeypatch.setenv("INVOCATION_ID", "abc")
+    prefix = relay._scope(target, turn)
+    assert prefix.startswith("systemd-run --user --scope") and turn.id in prefix
+    container = targets.Target(target.project, "cid", "vscode", "/workspaces/alpha")
+    assert relay._scope(container, turn) == ""              # lives in its container
+    config.host_run_scope = False
+    assert relay._scope(target, turn) == ""
+
+
+def test_the_launch_reports_the_pid_the_runner_wrote(setup):
+    config, target, home = setup
+    config.claude_command = "sh -c 'sleep 30'"
+    relay = Relay(config)
+    turn = Turn(str(uuid.uuid4()), "x", 0)
+    relay._launch(target, turn, str(uuid.uuid4()), False)
+    try:
+        d = home / ".cache/agent-relay-mcp" / turn.id
+        assert turn.pid > 1 and int((d / "pid").read_text()) == turn.pid
+        with open(f"/proc/{turn.pid}/stat") as f:      # the runner leads its group
+            assert int(f.read().split(") ")[1].split()[2]) == turn.pid
+    finally:
+        relay._stop(target, turn)

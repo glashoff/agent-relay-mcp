@@ -78,6 +78,10 @@ class Config:
     # Start a stopped dev container even if an earlier container of the
     # project could write its .devcontainer (see targets.may_start).
     start_writable_devcontainers: bool = False
+    # Start runs on this machine (host projects, or on the host) in a systemd
+    # scope of their own when the relay runs as a systemd service, so that
+    # restarting the relay does not end them.
+    host_run_scope: bool = True
     # A readable log of each project's conversation in its folder,
     # .relay/log.md (ignored by git through .relay/.gitignore), written as
     # Claude Code works, for following along in a Markdown preview.

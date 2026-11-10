@@ -200,38 +200,6 @@ if [ "$SERVICE" = 1 ]; then
     fi
 fi
 
-if [ "$RESTART" = 1 ]; then
-    STEP="restarting the relay"
-    say "Restarting the relay"
-    ok "runs in progress survive this; only requests being sent right now may fail"
-    run systemctl --user restart "$UNIT"
-    if [ "$DRY" = 0 ]; then
-        for _ in $(seq 1 30); do
-            sleep 1
-            if systemctl --user is-active --quiet "$UNIT"; then
-                if [ "$SESSION_BUS" = 0 ] || gdbus introspect --session --dest "$BUS_NAME" \
-                        --object-path /io/github/glashoff/AgentRelay1 > /dev/null 2>&1; then
-                    break
-                fi
-            fi
-        done
-        if ! systemctl --user is-active --quiet "$UNIT"; then
-            journalctl --user -u "$UNIT" -n 25 --no-pager >&2 || true
-            fail "the relay did not start (log above)."
-        fi
-        if [ "$SESSION_BUS" = 1 ] && ! gdbus introspect --session --dest "$BUS_NAME" \
-                --object-path /io/github/glashoff/AgentRelay1 > /dev/null 2>&1; then
-            journalctl --user -u "$UNIT" -n 25 --no-pager >&2 || true
-            note "The relay runs, but its approval interface is not on the session bus: nothing can be approved (log above)."
-        else
-            ok "running, with its approval interface on the session bus"
-        fi
-        CHANGED+=("relay restarted")
-    fi
-else
-    note "The relay was not restarted; it runs the code it started with until it is."
-fi
-
 # --- the GNOME extension --------------------------------------------------------------
 
 if [ "$EXTENSION" = 1 ]; then
@@ -316,6 +284,42 @@ EOF
             note "Log out and back in to load the extension: GNOME Shell on Wayland only loads extension code at login."
         fi
     fi
+fi
+
+# --- restarting the relay, last -------------------------------------------------
+
+if [ "$RESTART" = 1 ]; then
+    STEP="restarting the relay"
+    say "Restarting the relay"
+    # Last, after everything else is in place: whatever ran this script from
+    # inside the relay's service (an old run) ends with the restart.
+    ok "runs in progress survive this; only requests being sent right now may fail"
+    run systemctl --user restart "$UNIT"
+    if [ "$DRY" = 0 ]; then
+        for _ in $(seq 1 30); do
+            sleep 1
+            if systemctl --user is-active --quiet "$UNIT"; then
+                if [ "$SESSION_BUS" = 0 ] || gdbus introspect --session --dest "$BUS_NAME" \
+                        --object-path /io/github/glashoff/AgentRelay1 > /dev/null 2>&1; then
+                    break
+                fi
+            fi
+        done
+        if ! systemctl --user is-active --quiet "$UNIT"; then
+            journalctl --user -u "$UNIT" -n 25 --no-pager >&2 || true
+            fail "the relay did not start (log above)."
+        fi
+        if [ "$SESSION_BUS" = 1 ] && ! gdbus introspect --session --dest "$BUS_NAME" \
+                --object-path /io/github/glashoff/AgentRelay1 > /dev/null 2>&1; then
+            journalctl --user -u "$UNIT" -n 25 --no-pager >&2 || true
+            note "The relay runs, but its approval interface is not on the session bus: nothing can be approved (log above)."
+        else
+            ok "running, with its approval interface on the session bus"
+        fi
+        CHANGED+=("relay restarted")
+    fi
+else
+    note "The relay was not restarted; it runs the code it started with until it is."
 fi
 
 # --- summary ----------------------------------------------------------------------
