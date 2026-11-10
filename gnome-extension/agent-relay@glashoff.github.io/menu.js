@@ -111,6 +111,21 @@ export function fillMenu(menu, ui) {
         ], [['Cancel switch', () => ui.run(ui.client.call('CancelSwitch', s.project))]]));
     }
 
+    // What runs now
+    const working = state.projects.filter(p => p.busy);
+    if (working.length) {
+        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        menu.addMenuItem(heading('Working now'));
+        for (const p of working) {
+            const place = p.busy === 'host' && p.dev_container ? ' (on the host)' : '';
+            menu.addMenuItem(block([[`${p.name}${place}`, '']], [
+                ['Stop', () => ui.run(ui.client.call('StopProject', p.name, false), p.name)],
+                ['Stop and lock', () => ui.run(ui.client.call('StopProject', p.name, true),
+                    p.name)],
+            ]));
+        }
+    }
+
     // Active grants
     menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
     menu.addMenuItem(heading(state.grants.length ? 'Approved' : 'Every project is locked'));
@@ -178,8 +193,12 @@ export function fillMenu(menu, ui) {
         menu.addMenuItem(awake);
     }
 
-    if (state.grants.length) {
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    const notify = new PopupMenu.PopupSwitchMenuItem('Notify about activity too',
+        ui.notifyActivity);
+    notify.connect('toggled', (_item, on) => ui.setNotifyActivity(on));
+    menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    menu.addMenuItem(notify);
+
+    if (state.grants.length)
         menu.addAction('Revoke everything', () => ui.run(ui.client.call('RevokeAll', false)));
-    }
 }

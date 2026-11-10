@@ -119,9 +119,15 @@ echo "confirm it (Allow with full access):"
 eval_js "Main.extensionManager.lookup('$UUID').stateObj._dialog._confirm(); 'confirmed'" > /dev/null
 sleep 2
 "$VENV/bin/agent-relay-ctl" status | sed -n '/Grants/,/Waiting/p'
-echo "notifications now (answered requests are gone):"
+echo "notifications now (answered requests are gone, no 'started' by default):"
 eval_js "Main.messageTray.getSources().flatMap(s => s.notifications.map(n => n.title)).join(' || ')"
 
+echo "with 'Notify about activity too' on, a started request notifies:"
+eval_js "const ext = Main.extensionManager.lookup('$UUID').stateObj; ext._ui().setNotifyActivity(true); ext._settings.notifyActivity"
+mcp '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"send_message","arguments":{"project":"web","message":"one more"}}}'
+sleep 3
+eval_js "Main.messageTray.getSources().flatMap(s => s.notifications.map(n => n.title)).join(' || ')"
+eval_js "Main.extensionManager.lookup('$UUID').stateObj._ui().setNotifyActivity(false); 'off'" > /dev/null
 echo "grant dialog for web, on the host:"
 eval_js "const ext = Main.extensionManager.lookup('$UUID').stateObj; ext._openDialog({target: 'web', kind: 'host'}); ext._dialog._okButton.label"
 sleep 1

@@ -77,7 +77,11 @@ class Turn:
     # from the run, but only when needed: a reply not yet reported.
     output_loaded: bool = True
     logged: int = 0            # bytes of out.jsonl already in the project's log
-    last_logged: str = ""      # the last text written to the log
+    # The last text Claude Code wrote, held back from the log until it is
+    # clear whether it is the reply (then under a "Reply" header) or not,
+    # and where its line starts in out.jsonl (the log is "logged" up to there).
+    pending_text: str = ""
+    pending_start: int = -1
     closed: bool = False       # the run takes no more messages
     # The process id of the run, as seen at launch. The run directory is
     # writable where the run is, so its pid file is not trusted.
@@ -425,12 +429,12 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
         position = turn.offset
         entries = []
         for raw in data[:used].split(b"\n")[:-1]:
+            start = position
             position += len(raw) + 1
             turn.output.feed(raw.decode("utf-8", errors="replace"))
             items, turn.output.items = turn.output.items, []
             if position > turn.logged:      # not in the log yet (also after a restart)
-                entries += [self._log_entry(turn, item) for item in items]
-        turn.logged = max(turn.logged, position)
+                entries += [self._log_entry(turn, item, start) for item in items]
         if not used and len(data) >= READ_LIMIT:
             used = len(data)        # one line longer than the limit: skip it
         turn.offset += used
@@ -451,25 +455,42 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
         else:
             turn.phase = FAILED
             turn.error = "Cannot read the run: " + result.stderr.decode(errors="replace")[-500:]
+        if turn.phase != RUNNING:
+            entries.append(self._flush_text(turn))
         if turn.phase == FAILED and was in (STARTING, RUNNING):
             entries.append(project_log.ended("failed", turn.error))
+        # A text held back is read again after a restart, so the log is only
+        # as far as where it starts.
+        turn.logged = turn.pending_start if turn.pending_text else max(turn.logged, position)
+        entries = [e for e in entries if e]
         if entries:
             self._write_log(target.project, "".join(entries))
 
-    def _log_entry(self, turn: Turn, item: tuple) -> str:
-        """Markdown for one thing the run produced."""
+    def _log_entry(self, turn: Turn, item: tuple, start: int) -> str:
+        """Markdown for one thing the run produced (its line starts at start)."""
         kind = item[0]
-        if kind == "step":
-            return project_log.step(item[1])
-        if kind == "thinking":
-            return project_log.thinking(item[1])
         if kind == "text":
-            turn.last_logged = item[1]
-            return project_log.said(item[1])
-        text, is_error = item[1], item[2]
-        if text and text == turn.last_logged:
-            return project_log.reply("(the message above)", is_error)
-        return project_log.reply(text, is_error)
+            out = self._flush_text(turn)
+            turn.pending_text, turn.pending_start = item[1], start
+            return out
+        if kind == "result":
+            text, is_error = item[1], item[2]
+            if turn.pending_text and turn.pending_text == text:
+                turn.pending_text, turn.pending_start = "", -1
+                return project_log.reply(text, is_error)
+            return self._flush_text(turn) + project_log.reply(text, is_error)
+        out = self._flush_text(turn)
+        if kind == "step":
+            return out + project_log.step(item[1])
+        return out + project_log.thinking(item[1])
+
+    @staticmethod
+    def _flush_text(turn: Turn) -> str:
+        """A held-back text that turned out not to be the reply."""
+        if not turn.pending_text:
+            return ""
+        text, turn.pending_text, turn.pending_start = turn.pending_text, "", -1
+        return project_log.said(text)
 
     def _log_note(self, name: str, text: str) -> None:
         try:

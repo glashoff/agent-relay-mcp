@@ -117,21 +117,27 @@ class ProjectLog:
 
 
 # --- entries -----------------------------------------------------------------------
+# Compact: a bold header line with the time, then the content. A rule only
+# between requests.
+
+def _head(title: str, extra: str = "") -> str:
+    return f"**{clock()} · {title}**" + (f" {extra}" if extra else "")
+
 
 def request(message: str, *, where: str, continued: bool, earlier: str = "") -> str:
-    how = "continues the conversation" if continued else "new conversation"
-    text = f"\n---\n\n## {clock()} · Request ({how}, {where})\n\n{quoted(message)}\n\n"
+    how = "continued" if continued else "new conversation"
+    text = f"\n---\n\n{_head('Request', f'({how}, {where})')}\n{quoted(message)}\n\n"
     if earlier:
-        text += f"*Reply to the request before, not reported in the chat yet:*\n\n{quoted(earlier)}\n\n"
+        text += f"*Reply to the request before, not in the chat yet:*\n{quoted(earlier)}\n\n"
     return text
 
 
 def passed_in(message: str) -> str:
-    return f"### {clock()} · Message passed in\n\n{quoted(message)}\n\n"
+    return f"\n{_head('Passed in')}\n{quoted(message)}\n\n"
 
 
 def queued(message: str) -> str:
-    return f"### {clock()} · Message queued (follows as soon as possible)\n\n{quoted(message)}\n\n"
+    return f"\n{_head('Queued')} (follows as soon as possible)\n{quoted(message)}\n\n"
 
 
 def waiting(number: int, messages: list[str], full_access: bool, on_host: bool = False) -> str:
@@ -139,17 +145,17 @@ def waiting(number: int, messages: list[str], full_access: bool, on_host: bool =
         warning = " · asks to run on the host: full access"
     else:
         warning = " · no dev container: full access" if full_access else ""
-    body = "\n\n".join(quoted(m) for m in messages)
-    return (f"\n---\n\n## {clock()} · Waiting for approval at the laptop "
-            f"(number {number}){warning}\n\n{body}\n\n")
+    body = "\n>\n".join(quoted(m) for m in messages)
+    return (f"\n---\n\n{_head(f'Waiting for approval, number {number}', warning.lstrip(' '))}"
+            f"\n{body}\n\n")
 
 
 def note(text: str) -> str:
-    return f"*{clock()} · {safe(text, 500)}*\n\n"
+    return f"\n*{clock()} · {safe(text, 500)}*\n\n"
 
 
 def step(summary: str) -> str:
-    return f"- `{clock()}` `{inline(summary)}`\n"
+    return f"- {clock()} `{inline(summary)}`\n"
 
 
 def said(text: str) -> str:
@@ -157,13 +163,15 @@ def said(text: str) -> str:
 
 
 def thinking(text: str) -> str:
-    return f"\n*Thinking:*\n\n{quoted(text, MAX_THINKING)}\n\n"
+    lines = quoted(text, MAX_THINKING).splitlines()
+    lines[0] = "> *Thinking:* " + lines[0][2:] if lines else "> *Thinking*"
+    return "\n" + "\n".join(lines) + "\n\n"
 
 
 def reply(text: str, is_error: bool) -> str:
     title = "Ended with an error" if is_error else "Reply"
-    return f"\n### {clock()} · {title}\n\n{safe(text)}\n\n"
+    return f"\n{_head(title)}\n{safe(text)}\n\n"
 
 
 def ended(phase: str, error: str) -> str:
-    return f"\n### {clock()} · Ended: {safe(phase, 50)}\n\n{quoted(error, 1500)}\n\n"
+    return f"\n{_head('Ended: ' + safe(phase, 50))}\n{quoted(error, 1500)}\n\n"

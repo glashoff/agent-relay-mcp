@@ -57,12 +57,14 @@ def test_the_log_follows_the_run_without_anyone_asking(setup):
         # No get_updates: the relay reads the output on its own.
         await until(lambda: "Looking into it." in read(folder))
         text = read(folder)
-        assert "Request (new conversation, on the host)" in text
+        assert "· Request** (new conversation, on the host)" in text
         assert "> please think, then sleep 2" in text
         assert "Pondering the request." in text and "`Bash: List files`" in text
         assert "Reply" not in text
         await until(lambda: "Reply" in read(folder))
-        assert "Done: please think, then sleep 2 (new)" in read(folder)
+        # The reply has its header above it, nothing below.
+        assert "· Reply**\nDone: please think, then sleep 2 (new)\n" in read(folder)
+        assert "message above" not in read(folder)
         assert (folder / ".relay/.gitignore").read_text() == "*\n"
     run(scenario())
 
@@ -75,11 +77,11 @@ def test_messages_while_it_works_and_requests_are_logged(setup):
         await relay.send_message("alpha", "sleep 2", False, 0)
         await until(lambda: relay.conversations["alpha"].turn.phase == "running")
         await relay.send_message("alpha", "and also this", False, 0)
-        assert "Message passed in" in read(folder) and "> and also this" in read(folder)
+        assert "· Passed in**" in read(folder) and "> and also this" in read(folder)
         await Control(relay).revoke_all()
         await relay.send_message("alpha", "locked now", False, 0)
         number = next(iter(relay.access.requests.values())).number
-        assert f"Waiting for approval at the laptop (number {number})" in read(folder)
+        assert f"Waiting for approval, number {number}" in read(folder)
         await Control(relay).deny(next(iter(relay.access.requests)))
         assert f"Request {number} was denied" in read(folder)
     run(scenario())
@@ -151,3 +153,32 @@ def test_thinking_display_is_passed_to_claude_code(setup):
     run(Relay(config).send_message("alpha", "quick", False, 8))
     args = (folder / "fake-args.txt").read_text()
     assert '"--thinking-display", "summarized"' in args
+
+
+def test_a_held_back_reply_survives_a_restart(setup):
+    """The last text is held back until it is clear that it is the reply; a
+    restart in between must not lose it."""
+    config, folder = setup
+
+    async def scenario():
+        relay = Relay(config)
+        await relay.send_message("alpha", "quick", False, 0)
+        await until(lambda: relay.conversations["alpha"].turn.phase == "finished")
+        turn = relay.conversations["alpha"].turn
+        assert not turn.pending_text and turn.logged == turn.offset
+    run(scenario())
+
+
+def test_the_reply_header_goes_above_the_reply():
+    from agent_relay_mcp.relay import Turn
+    import uuid
+    turn = Turn(str(uuid.uuid4()), "x", 0)
+    relay = Relay.__new__(Relay)
+    out = relay._log_entry(turn, ("text", "Working on it."), 0)
+    assert out == ""                                    # held back
+    out = relay._log_entry(turn, ("step", "Bash: ls"), 10)
+    assert "Working on it." in out and "`Bash: ls`" in out
+    assert relay._log_entry(turn, ("text", "All done."), 20) == ""
+    assert turn.pending_start == 20
+    out = relay._log_entry(turn, ("result", "All done.", False), 30)
+    assert "· Reply**\nAll done.\n" in out and out.count("All done.") == 1

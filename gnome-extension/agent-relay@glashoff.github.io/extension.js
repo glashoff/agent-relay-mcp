@@ -20,6 +20,7 @@ import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js'
 import {RelayClient, ServiceClient} from './client.js';
 import {AccessDialog} from './dialogs.js';
 import {fillMenu} from './menu.js';
+import * as Settings from './settings.js';
 import {duration, oneLine, targetName, where} from './text.js';
 
 const ICON_LOCKED = 'changes-prevent-symbolic';
@@ -92,6 +93,7 @@ export default class AgentRelayExtension extends Extension {
         this._warned = new Set();           // grants warned about ending soon
         this._seenRequests = new Set();
         this._requestNotes = new Map();     // request id: its notification
+        this._settings = Settings.load();
         this._source = null;
         this._firstState = true;
 
@@ -175,6 +177,12 @@ export default class AgentRelayExtension extends Extension {
             grantDialog: (target, kind = '') => this._openDialog({target, kind}),
             approveDialog: (request, kind = '') => this._openDialog({request, kind}),
             run: (promise, what) => this._run(promise, what),
+            notifyActivity: this._settings.notifyActivity,
+            setNotifyActivity: on => {
+                this._settings.notifyActivity = on;
+                Settings.save(this._settings);
+                this._render();
+            },
         };
     }
 
@@ -262,7 +270,17 @@ export default class AgentRelayExtension extends Extension {
         }
     }
 
+    // By default only what needs you: new requests (below) and approvals about
+    // to end (_checkState). The rest only with "Notify about activity".
     _onEvent(event) {
+        if (event.type === 'request_added' || event.type === 'request_answered' ||
+                event.type === 'request_expired')
+            this._onRequestEvent(event);
+        else if (this._settings.notifyActivity)
+            this._onActivity(event);
+    }
+
+    _onRequestEvent(event) {
         switch (event.type) {
         case 'request_added': {
             if (this._seenRequests.has(event.request))
@@ -276,8 +294,14 @@ export default class AgentRelayExtension extends Extension {
             break;
         case 'request_expired':
             this._forget(event.request);
-            this._notify(`Request for ${event.project} expired`, 'Nothing was run.');
+            if (this._settings.notifyActivity)
+                this._notify(`Request for ${event.project} expired`, 'Nothing was run.');
             break;
+        }
+    }
+
+    _onActivity(event) {
+        switch (event.type) {
         case 'grant_ended':
             if (event.reason !== 'revoked')
                 this._notify('Approval ended', `Reason: ${event.reason}.`);

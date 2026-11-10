@@ -86,9 +86,11 @@ bar (a padlock; open when something is approved, a warning sign for full
 access; with the number of waiting requests) and a tile in quick settings,
 both with the same menu: the relay service with start, stop and restart,
 requests waiting for approval, active grants with revoke, giving grants, and
-keeping the computer awake. It notifies about new requests (with allow and
-deny), grants about to end, and requests that start (with stop). It does not
-run on the lock screen; after unlocking it says what is waiting.
+keeping the computer awake, and what is working now (with stop). It notifies
+only when something needs you: new requests (with allow and deny) and grants
+about to end; "Notify about activity too" in the menu (off by default) adds
+requests that start, approvals that end and the like. It does not run on the
+lock screen; after unlocking it says what is waiting.
 
 `scripts/install.sh` (below) copies it into
 `~/.local/share/gnome-shell/extensions` and enables it; it loads at the next
