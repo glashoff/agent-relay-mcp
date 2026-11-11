@@ -1,0 +1,14 @@
+# CPU-only PyTorch (for Pocket TTS); without this index pip pulls the CUDA
+# build plus several GB of nvidia-* wheels.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+faster-whisper==1.2.1
+ctranslate2==4.9.0
+# faster-whisper 1.2.1 calls av.open(..., metadata_errors=...), which PyAV 16+ removed.
+av==15.1.0
+piper-tts==1.8.0
+pocket-tts==4.0.1
+onnxruntime==1.31.1
+huggingface_hub==2.4.0
+numpy==2.5.4
+pytest==9.2.0

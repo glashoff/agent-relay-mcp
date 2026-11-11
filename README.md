@@ -91,13 +91,29 @@ about to end; "Notify about activity too" in the menu (off by default) adds
 requests that start, approvals that end and the like. It does not run on the
 lock screen; after unlocking it says what is waiting.
 
+A "Voice" submenu controls the local voice service (`voice/`, see
+`docs/voice-plan.md`): a switch starts and stops `agent-relay-voice.service`
+(greyed out with a hint while the unit is not installed), and while the
+service runs it shows what it is doing (listening, paused, microphone
+muted, hearing you, transcribing, thinking, speaking, errors and models
+loading), a "Listening" switch to pause without stopping the service, "Stop
+speaking", "New conversation", the choice of speech recognition, voice and
+Claude model, and the last exchange (in full in a dialog). A small
+microphone next to the panel icon shows that voice is on: highlighted while
+it hears you, crossed out while muted or paused. The extension talks to the
+service over `$XDG_RUNTIME_DIR/agent-relay-voice/control.sock` (JSON lines,
+not D-Bus) and reconnects when the service restarts; nothing in the voice
+part can grant or approve access.
+
 `scripts/install.sh` (below) copies it into
 `~/.local/share/gnome-shell/extensions` and enables it; it loads at the next
 login.
 
 `gnome-extension/test-in-headless-shell.sh` runs it in a headless GNOME Shell
-with a private session bus, its own folders and a throwaway relay, and leaves
-screenshots; it touches nothing of the running session.
+with a private session bus, its own folders, a throwaway relay and a fake
+voice service (`gnome-extension/fake-voice-service.py`, a test helper that
+implements the control socket; `--demo 10` plays a conversation in a loop),
+and leaves screenshots; it touches nothing of the running session.
 
 ### Keeping the computer awake
 
@@ -238,6 +254,43 @@ Then add a custom connector in Claude (Settings → Connectors) with the URL
 `https://example.org/<secret>/mcp` and no authentication. Adding it reports
 that it "couldn't determine how this server signs in"; that is expected,
 choose *Continue anyway*.
+
+### Unix sockets
+
+For clients on this machine that should not need the TCP port (the voice
+service runs in a container without a path to the host's loopback), the relay
+can serve the same endpoint on a Unix socket as well, and its events on a
+second one:
+
+```toml
+mcp_socket = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"
+events_socket = "$XDG_RUNTIME_DIR/agent-relay/events.sock"
+```
+
+- `mcp_socket` is the MCP endpoint, with the same tools and the same `Host`
+  and `Origin` checks (send `Host: localhost:8765`); the TCP port stays.
+- `events_socket` sends every event of the control interface (run started or
+  ended, request added, grant ended …) as one JSON object per line, exactly
+  what the D-Bus signal `Event` carries. It reads nothing: no commands, so
+  nothing can be approved through it. A client that does not keep up is
+  dropped. It does not need D-Bus.
+- Both are off unless set. The directory is created with mode 700, the
+  sockets with mode 600, so only your user can connect; mount the directory
+  into a container to pass them on. A socket left over from a crash is
+  replaced; one another relay is listening on stops the start.
+
+### Voice on the laptop (optional)
+
+`voice/` holds a voice service: speech recognition (faster-whisper or
+whisper.cpp, on the CPU), a locked-down Claude Code instance (web search and
+fetch plus this relay's MCP tools, nothing else) and German speech output
+(Pocket TTS or Piper). It runs in a Docker container: internet only, no local
+networks, no session bus, read-only root, no capabilities for the service. It
+needs the relay's Unix sockets above. Setup: `voice/agent-relay-voice build`,
+`voice/agent-relay-voice token`, `voice/install.sh`, then
+`systemctl --user start agent-relay-voice`, or switch it on from the GNOME
+extension's Voice menu. Details in `voice/README.md`, the design in
+`docs/voice-plan.md`.
 
 ## Security
 

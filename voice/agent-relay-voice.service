@@ -1,0 +1,19 @@
+# systemd user unit for the voice service. install.sh copies it to
+# ~/.config/systemd/user/ with @LAUNCHER@ replaced by the absolute path of
+# ./agent-relay-voice. The GNOME extension switches voice on and off by
+# starting and stopping this unit.
+[Unit]
+Description=agent-relay voice service (Docker container)
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=@LAUNCHER@ run
+ExecStop=@LAUNCHER@ stop
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

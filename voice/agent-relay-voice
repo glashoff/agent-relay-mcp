@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Host side of the voice service: builds and runs its Docker container,
+creates the Claude token, and talks to the running service.
+
+Standard library only. Commands:
+
+  build            build the image (agent-relay-voice:latest)
+  run              run the service in the foreground (what the systemd unit does)
+  stop             stop the running container
+  token            create the Claude Code token (claude setup-token) for the service
+  status           print the service's state through the control socket
+  probe            live microphone levels and mute state, to check a headset
+  listen           audio loop only: mute changes and transcripts
+  cli ARGS...      run the container's command line, e.g. cli say "Hallo"
+
+The container gets exactly: the pulse socket, the relay's socket directory
+(read-only), the control socket directory, the token file (read-only), the
+settings directory, and the models volume. See README.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+IMAGE = "agent-relay-voice:latest"
+CONTAINER = "agent-relay-voice"
+VOLUME = "agent-relay-voice-models"
+RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+CONFIG_DIR = CONFIG_HOME / "agent-relay-voice"
+TOKEN_FILE = CONFIG_DIR / "claude-token"
+SETTINGS_DIR = CONFIG_DIR / "settings"
+PULSE_SOCKET = RUNTIME / "pulse" / "native"
+RELAY_DIR = RUNTIME / "agent-relay"
+CONTROL_DIR = RUNTIME / "agent-relay-voice"
+CONTROL_SOCKET = CONTROL_DIR / "control.sock"
+DNS = ["1.1.1.1", "9.9.9.9"]
+
+CLAUDE_MODELS_URL = "https://api.anthropic.com/v1/models"
+CLAUDE_TOKEN_PAGE = "https://claude.ai/settings/claude-code"
+TOKEN_MIN_LENGTH = 60
+
+
+def die(message: str) -> None:
+    sys.exit(f"agent-relay-voice: {message}")
+
+
+def docker(*args: str, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    if not shutil.which("docker"):
+        die("docker is not installed")
+    return subprocess.run(["docker", *args], check=check, text=True,
+                          capture_output=capture)
+
+
+def image_exists() -> bool:
+    return docker("image", "inspect", IMAGE, check=False, capture=True).returncode == 0
+
+
+def build(no_cache: bool = False) -> None:
+    args = ["build", "-t", IMAGE]
+    if no_cache:
+        args.append("--no-cache")
+    # the service user gets the host user's ids, so the mounted sockets work
+    args += ["--build-arg", f"VOICE_UID={os.getuid()}", "--build-arg", f"VOICE_GID={os.getgid()}"]
+    docker(*args, str(HERE))
+
+
+def host_addresses() -> list[str]:
+    """The host's own global addresses, which the firewall rejects too (the
+    private ones are covered anyway; a public one would otherwise be open)."""
+    try:
+        out = subprocess.run(["ip", "-j", "addr"], capture_output=True, text=True, timeout=5).stdout
+        data = json.loads(out or "[]")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    found = []
+    for link in data:
+        for addr in link.get("addr_info", []):
+            if addr.get("scope") == "global" and addr.get("local"):
+                found.append(addr["local"])
+    return found
+
+
+def private_dir(path: Path) -> None:
+    """Created by us, mode 700, so Docker does not create it as root."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def run_args(name: str | None, *, interactive: bool = False, sink: str | None = None,
+             source: str | None = None) -> list[str]:
+    if not PULSE_SOCKET.exists():
+        die(f"no PipeWire/PulseAudio socket at {PULSE_SOCKET}")
+    private_dir(RELAY_DIR)
+    private_dir(CONTROL_DIR)
+    private_dir(CONFIG_DIR)
+    private_dir(SETTINGS_DIR)
+    args = ["run", "--rm", "--init"]
+    if name:
+        args += ["--name", name]
+    if interactive:
+        args += ["-it"] if sys.stdin.isatty() else ["-i"]
+    args += [
+        "--read-only",
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=512m,mode=1777",
+        "--tmpfs", "/run:rw,nosuid,nodev,size=16m,mode=755",
+        "--tmpfs", f"/home/voice:rw,nosuid,nodev,size=512m,uid={os.getuid()},gid={os.getgid()},mode=700",
+        # NET_ADMIN for the firewall; SETUID/SETGID/SETPCAP to drop to the
+        # service user and clear the bounding set; KILL so that the init
+        # process (docker-init, root) can forward SIGTERM to the service user.
+        # The service itself keeps none of them.
+        "--cap-drop", "ALL", "--cap-add", "NET_ADMIN", "--cap-add", "SETUID",
+        "--cap-add", "SETGID", "--cap-add", "SETPCAP", "--cap-add", "KILL",
+        "--security-opt", "no-new-privileges",
+        "--pids-limit", "1024",
+        "-e", f"VOICE_BLOCK_EXTRA={','.join(host_addresses())}",
+        "-e", f"VOICE_UID={os.getuid()}", "-e", f"VOICE_GID={os.getgid()}",
+        "-v", f"{PULSE_SOCKET}:/run/pulse/native",
+        "-v", f"{RELAY_DIR}:/run/agent-relay:ro",
+        "-v", f"{CONTROL_DIR}:/run/agent-relay-voice",
+        "-v", f"{SETTINGS_DIR}:/config",
+        "-v", f"{VOLUME}:/data",
+    ]
+    for server in DNS:
+        args += ["--dns", server]
+    if TOKEN_FILE.is_file():
+        if TOKEN_FILE.stat().st_mode & 0o077:
+            TOKEN_FILE.chmod(0o600)
+            print(f"Tightened the permissions of {TOKEN_FILE} to 600", file=sys.stderr)
+        args += ["-v", f"{TOKEN_FILE}:/run/secrets/claude-token:ro"]
+    if sink:
+        args += ["-e", f"PULSE_SINK={sink}"]
+    if source:
+        args += ["-e", f"PULSE_SOURCE={source}"]
+    return args
+
+
+def cmd_run(args) -> None:
+    if not image_exists():
+        print(f"{IMAGE} does not exist yet; building it (takes a while)", file=sys.stderr)
+        build()
+    # a container left over from a crash would block the name
+    docker("rm", "-f", CONTAINER, check=False, capture=True)
+    command = ["docker", *run_args(CONTAINER, sink=args.sink, source=args.source), IMAGE]
+    if args.no_models:
+        command += ["python3", "-m", "agent_relay_voice", "serve", "--no-models"]
+    os.execvp("docker", command)
+
+
+def cmd_stop(args) -> None:
+    docker("stop", "-t", "10", CONTAINER, check=False, capture=True)
+
+
+def cmd_cli(args, extra: list[str]) -> None:
+    if not image_exists():
+        build()
+    command = ["docker", *run_args(None, interactive=True, sink=args.sink, source=args.source),
+               IMAGE, "python3", "-m", "agent_relay_voice", *extra]
+    os.execvp("docker", command)
+
+
+def control_request(requests: list[dict], timeout: float = 5.0) -> list[dict]:
+    if not CONTROL_SOCKET.exists():
+        die(f"the service is not running (no {CONTROL_SOCKET})")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(str(CONTROL_SOCKET))
+        f = s.makefile("rw", encoding="utf-8")
+        replies = []
+        for i, request in enumerate(requests, 1):
+            f.write(json.dumps({"id": i, **request}) + "\n")
+            f.flush()
+            while True:
+                message = json.loads(f.readline())
+                if message.get("id") == i:
+                    replies.append(message)
+                    break
+        return replies
+
+
+def cmd_status(args) -> None:
+    requests = [{"cmd": "state"}]
+    if args.options:
+        requests.append({"cmd": "options"})
+    for reply in control_request(requests):
+        print(json.dumps(reply.get("result") if reply.get("ok") else reply, indent=2,
+                         ensure_ascii=False))
+
+
+# --- the token ---------------------------------------------------------------
+
+def token_accepted(token: str) -> bool | None:
+    """Whether Anthropic accepts this token; None if the check did not happen.
+    Only 401 counts as a rejection."""
+    request = urllib.request.Request(CLAUDE_MODELS_URL, headers={
+        "authorization": f"Bearer {token}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": "oauth-2025-04-20"})
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            return True
+    except urllib.error.HTTPError as error:
+        return error.code != 401
+    except OSError:
+        return None
+
+
+def paste_token() -> str:
+    """Reads a pasted token, which arrives in more than one line if the
+    terminal wrapped it on the way out of setup-token."""
+    print("\nPaste the token here, then press Enter on an empty line:")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip():
+            break
+        lines.append(line)
+    return "".join("".join(lines).split())
+
+
+def cmd_token(args) -> None:
+    """Creates the service's Claude Code token with "claude setup-token".
+
+    setup-token is a browser flow in a full-screen terminal interface that
+    prints nothing when its output is redirected, so the token is read off the
+    screen and pasted back here. A token from setup-token can only make model
+    requests: the instance cannot reach claude.ai connectors or the account.
+    """
+    if not sys.stdin.isatty():
+        die("token asks questions, so it needs a terminal")
+    if not shutil.which("claude"):
+        die("no claude on the host to create a token with")
+    if TOKEN_FILE.is_file():
+        print(f"{TOKEN_FILE} already holds a token, created "
+              f"{datetime.fromtimestamp(TOKEN_FILE.stat().st_mtime):%Y-%m-%d %H:%M}. "
+              f"A new one does not revoke it; that is done at {CLAUDE_TOKEN_PAGE}.")
+        if input("Create another one and use that? [y/N] ").strip().lower() not in ("y", "yes"):
+            return
+    print("\nclaude setup-token opens a browser and prints the token at the end.")
+    subprocess.run(["claude", "setup-token"])
+    token = paste_token()
+    if len(token) < TOKEN_MIN_LENGTH or not re.fullmatch(r"\S+", token):
+        die(f"Only {len(token)} characters, too short for a token; nothing was written. "
+            "Copy the whole token, including what a wrapped line put on the next row.")
+    accepted = token_accepted(token)
+    if accepted is False:
+        die("Anthropic rejects this token, so nothing was written. A copy that lost its "
+            "end is the usual reason; run this again.")
+    if accepted is None:
+        print("Warning: could not reach the API to check the token, writing it unchecked",
+              file=sys.stderr)
+    private_dir(CONFIG_DIR)
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    TOKEN_FILE.chmod(0o600)
+    print(f"Written to {TOKEN_FILE}. It is listed at {CLAUDE_TOKEN_PAGE} as of now "
+          f"({datetime.now():%Y-%m-%d %H:%M}), which is also where it is revoked.\n"
+          "Restart the service to use it: systemctl --user restart agent-relay-voice")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="agent-relay-voice", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("build", help="build the image")
+    p.add_argument("--no-cache", action="store_true")
+    for name in ("run", "probe", "listen", "cli"):
+        p = sub.add_parser(name)
+        p.add_argument("--sink", help="pulse sink instead of the default (PULSE_SINK)")
+        p.add_argument("--source", help="pulse source instead of the default (PULSE_SOURCE)")
+        if name == "run":
+            p.add_argument("--no-models", action="store_true", help=argparse.SUPPRESS)
+    sub.add_parser("stop")
+    sub.add_parser("token")
+    p = sub.add_parser("status")
+    p.add_argument("--options", action="store_true", help="also list the choices")
+    args, extra = parser.parse_known_args()
+    if extra and args.command != "cli":
+        parser.error(f"unrecognized arguments: {' '.join(extra)}")
+    if args.command == "build":
+        build(args.no_cache)
+    elif args.command == "run":
+        cmd_run(args)
+    elif args.command == "stop":
+        cmd_stop(args)
+    elif args.command == "token":
+        cmd_token(args)
+    elif args.command == "status":
+        cmd_status(args)
+    elif args.command == "probe":
+        cmd_cli(args, ["probe"])
+    elif args.command == "listen":
+        cmd_cli(args, ["listen"])
+    elif args.command == "cli":
+        cmd_cli(args, extra)
+
+
+if __name__ == "__main__":
+    main()

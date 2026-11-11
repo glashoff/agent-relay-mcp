@@ -1,0 +1,7 @@
+**/__pycache__
+**/.pytest_cache
+host
+*.md
+agent-relay-voice
+agent-relay-voice.service
+install.sh
