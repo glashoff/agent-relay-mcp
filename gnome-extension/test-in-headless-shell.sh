@@ -1,7 +1,8 @@
 #!/bin/bash
 # Runs the extension in a headless GNOME Shell of its own: a private session
 # bus, its own data, config, cache and runtime folders under a temporary
-# directory, and a relay of its own with throwaway projects. Nothing of the
+# directory, a relay of its own with throwaway projects, and a fake voice
+# service (fake-voice-service.py) for the "Voice" submenu. Nothing of the
 # real session is touched, and nothing is installed or enabled there.
 #
 #   gnome-extension/test-in-headless-shell.sh [relay-venv]
@@ -146,20 +147,112 @@ sleep 1
 shot quick-settings-menu
 eval_js "Main.panel.statusArea.quickSettings.menu.close(); 'ok'" > /dev/null
 
+# Voice: the submenu against the fake service (fake-voice-service.py). The
+# private bus has no systemd, so the unit is "unavailable" and the on/off
+# switch is insensitive; the rest works over the control socket.
+VOICE="Main.extensionManager.lookup('$UUID').stateObj"
+voice_text() {
+    eval_js "const ext = $VOICE; const s = [...ext._voiceSections][0]; const b = Main.panel.statusArea['$UUID']; [s.item.label.text, s._detail.visible ? s._detail.label.text : '-', 'switch ' + s._switch.state + (s._switch.reactive ? '' : ' (insensitive)'), 'mic ' + (b.mic.visible ? b.mic.icon_name + ' ' + b.mic.style_class : 'hidden')].join(' | ')"
+}
+fake() { python3 "$FAKE" send "$1" > /dev/null; }
+echo "voice before the service runs:"
+voice_text
+python3 "$FAKE" > "$OUT/fake-voice.log" 2>&1 &
+FAKE_PID=$!
+sleep 4
+echo "voice after the service started (reconnects by itself):"
+voice_text
+voice_open() {
+    # Opening the menu refreshes and rebuilds it; open the submenu after that.
+    eval_js "Main.panel.statusArea['$UUID'].menu.open(); 'open'" > /dev/null
+    sleep 1
+    eval_js "[...$VOICE._voiceSections].find(s => s.item.get_stage())?.item.setSubmenuShown(true); 'open'" > /dev/null
+    sleep 1
+}
+voice_open
+shot voice-listening
+eval_js "const v = [...$VOICE._voiceSections].find(s => s.item.get_stage()).item.menu.actor.vadjustment; v.value = v.upper; 'scrolled'" > /dev/null
+sleep 0.5
+shot voice-choices
+echo "pause listening from the menu:"
+eval_js "const s = [...$VOICE._voiceSections][0]; s._listening.toggle(); 'toggled'" > /dev/null
+sleep 1
+voice_text
+eval_js "[...$VOICE._voiceSections][0]._listening.state"
+fake '{"cmd": "set", "listening": true}'
+fake '{"cmd": "fake_phase", "phase": "hearing"}'
+sleep 1
+echo "hearing:"
+voice_text
+fake '{"cmd": "fake_phase", "phase": "muted"}'
+sleep 1
+echo "muted:"
+voice_text
+fake '{"cmd": "fake_phase", "phase": "speaking"}'
+fake '{"cmd": "fake_exchange", "user": "Schick an das Projekt web: refactor den Parser und schreib Tests dafür, bitte mit pytest und ohne neue Abhängigkeiten.", "assistant": "Ich habe den Auftrag an das Projekt web geschickt. Es ist gesperrt und wartet auf deine Freigabe am Laptop, Nummer drei. Sobald du ihn freigibst, läuft er los, und ich sage dir Bescheid, wenn er fertig ist."}'
+sleep 1
+echo "speaking, with an exchange (stop button reactive?):"
+voice_text
+eval_js "const s = [...$VOICE._voiceSections][0]; [s._stopButton.reactive, s._you.label.text, s._claude.label.text].join(' | ')"
+voice_open
+shot voice-speaking
+echo "stop speaking, choose speech recognition 'small' and the model 'haiku':"
+eval_js "const s = [...$VOICE._voiceSections][0]; s._stopButton.emit('clicked', 1); 'ok'" > /dev/null
+eval_js "const s = [...$VOICE._voiceSections][0]; s._choiceItems.find(([k, id]) => id === 'fw-small')[2].activate(null); 'ok'" > /dev/null
+sleep 0.5
+voice_text
+eval_js "const s = [...$VOICE._voiceSections][0]; s._choiceItems.filter(([, , i]) => i._ornament === 2).map(([k, id]) => k + '=' + id).join(' ')" 2>&1 | head -1
+eval_js "$VOICE._voice.set({claude_model: 'haiku'}).then(() => 'set'); JSON.stringify($VOICE._voice.state?.settings)"
+sleep 2.5
+eval_js "JSON.stringify($VOICE._voice.state)"
+echo "a refused setting (notification):"
+eval_js "$VOICE._voiceUi().run($VOICE._voice.set({tts: 'nope'}), 'Voice'); 'sent'" > /dev/null
+sleep 1
+eval_js "Main.messageTray.getSources().flatMap(s => s.notifications.map(n => n.title + ' | ' + n.body)).filter(t => t.includes('Voice')).join(' || ')"
+fake '{"cmd": "fake_exchange", "user": "Wie ist das Wetter morgen?", "assistant": "Morgen bewölkt, zwölf Grad."}'
+sleep 0.5
+echo "the whole exchange in a dialog:"
+eval_js "$VOICE._showExchange(); String(Boolean($VOICE._dialog))"
+sleep 1
+shot voice-exchange
+eval_js "$VOICE._dialog?.close(); 'closed'" > /dev/null
+fake '{"cmd": "fake_phase", "phase": "error", "error": "No microphone found"}'
+sleep 0.5
+echo "error:"
+voice_text
+fake '{"cmd": "fake_phase", "phase": "starting", "loading": "speech recognition model faster-whisper large-v3-turbo"}'
+sleep 0.5
+echo "loading:"
+voice_text
+echo "the service stops:"
+fake '{"cmd": "fake_quit"}'
+sleep 1
+voice_text
+python3 "$FAKE" > "$OUT/fake-voice.log" 2>&1 &
+FAKE_PID=$!
+sleep 4
+echo "and starts again:"
+voice_text
+eval_js "Main.panel.statusArea['$UUID'].menu.close()" > /dev/null
+
 echo "disable and enable again (as on lock and unlock):"
 eval_js "Main.extensionManager.disableExtension('$UUID')" > /dev/null
 sleep 1
 eval_js "Main.extensionManager.enableExtension('$UUID')" > /dev/null
 sleep 2
 eval_js "const e = Main.extensionManager.lookup('$UUID'); [e.state, String(e.error ?? '')].join(' ')"
+sleep 4
+echo "voice after enabling again:"
+voice_text
 echo "errors in the shell log:"
 grep -iE "agent.relay|JS ERROR|TypeError|ReferenceError" "$OUT/shell.log" | grep -v "^$" | head -20 || true
-kill $RELAY $SHELL_PID 2>/dev/null
+kill $RELAY $SHELL_PID $FAKE_PID 2>/dev/null
 wait 2>/dev/null
 SESSION
 
 env -i HOME="$OUT/home" PATH="$PATH" LANG=en_US.UTF-8 \
     XDG_DATA_HOME="$OUT/data" XDG_CONFIG_HOME="$OUT/config" XDG_CACHE_HOME="$OUT/cache" \
     XDG_RUNTIME_DIR="$OUT/runtime" OUT="$OUT" VENV="$VENV" UUID="$UUID" \
+    FAKE="$HERE/fake-voice-service.py" \
     dbus-run-session -- bash "$OUT/session.sh" 2> "$OUT/dbus.log"
 echo "screenshots: $(ls "$OUT"/*.png 2>/dev/null | tr '\n' ' ')"

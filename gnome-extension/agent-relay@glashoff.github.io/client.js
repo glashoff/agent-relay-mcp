@@ -131,28 +131,39 @@ function busCall(service, path, iface, method, args, replyType) {
     });
 }
 
-// The relay's systemd user unit: its state, and starting, stopping and
-// restarting it. On a bus without systemd (a test session) it is "unavailable".
+// A systemd user unit (by default the relay's): its state, and starting,
+// stopping and restarting it. On a bus without systemd (a test session) it is
+// "unavailable".
 export class ServiceClient {
-    async activeState() {
+    constructor(unit = UNIT) {
+        this.unit = unit;
+    }
+
+    // {load: 'loaded' | 'not-found' | ..., active: 'active' | 'inactive' | ...};
+    // both 'unavailable' when systemd cannot be asked.
+    async unitState() {
         try {
             const [path] = (await busCall('org.freedesktop.systemd1', '/org/freedesktop/systemd1',
                 'org.freedesktop.systemd1.Manager', 'LoadUnit',
-                new GLib.Variant('(s)', [UNIT]), '(o)')).deepUnpack();
-            const [value] = (await busCall('org.freedesktop.systemd1', path,
-                'org.freedesktop.DBus.Properties', 'Get',
-                new GLib.Variant('(ss)', ['org.freedesktop.systemd1.Unit', 'ActiveState']),
-                '(v)')).deepUnpack();
-            return value.deepUnpack();
+                new GLib.Variant('(s)', [this.unit]), '(o)')).deepUnpack();
+            const [props] = (await busCall('org.freedesktop.systemd1', path,
+                'org.freedesktop.DBus.Properties', 'GetAll',
+                new GLib.Variant('(s)', ['org.freedesktop.systemd1.Unit']),
+                '(a{sv})')).deepUnpack();
+            return {load: props.LoadState.deepUnpack(), active: props.ActiveState.deepUnpack()};
         } catch {
-            return 'unavailable';
+            return {load: 'unavailable', active: 'unavailable'};
         }
+    }
+
+    async activeState() {
+        return (await this.unitState()).active;
     }
 
     // verb: 'Start', 'Stop' or 'Restart'
     async control(verb) {
         await busCall('org.freedesktop.systemd1', '/org/freedesktop/systemd1',
             'org.freedesktop.systemd1.Manager', `${verb}Unit`,
-            new GLib.Variant('(ss)', [UNIT, 'replace']), '(o)');
+            new GLib.Variant('(ss)', [this.unit, 'replace']), '(o)');
     }
 }

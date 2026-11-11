@@ -162,3 +162,37 @@ class AccessDialog extends ModalDialog.ModalDialog {
         this.close();
     }
 });
+
+// The last voice exchange in full: what was understood and what Claude
+// answered. Plain text only.
+export const ExchangeDialog = GObject.registerClass(
+class ExchangeDialog extends ModalDialog.ModalDialog {
+    _init(user, assistant) {
+        super._init({styleClass: 'agent-relay-dialog'});
+        this.contentLayout.add_child(new Dialog.MessageDialogContent({
+            title: 'Last exchange',
+            description: 'As understood by speech recognition, and as answered.',
+        }));
+        const box = new St.BoxLayout({vertical: true, style_class: 'agent-relay-exchange'});
+        for (const [who, text] of [['You', user], ['Claude', assistant]]) {
+            box.add_child(new St.Label({text: who, style_class: 'agent-relay-heading'}));
+            const label = new St.Label({
+                text: String(text ?? '').trim() || '(nothing)',
+                style_class: 'agent-relay-message',
+            });
+            label.clutter_text.line_wrap = true;
+            box.add_child(label);
+        }
+        const scroll = new St.ScrollView({
+            style_class: 'agent-relay-exchange-scroll',
+            hscrollbar_policy: St.PolicyType.NEVER,
+            vscrollbar_policy: St.PolicyType.AUTOMATIC,
+            x_expand: true, y_expand: true,
+        });
+        scroll.child = box;
+        this.contentLayout.add_child(scroll);
+        this.addButton({
+            label: 'Close', action: () => this.close(), key: Clutter.KEY_Escape, default: true,
+        });
+    }
+});

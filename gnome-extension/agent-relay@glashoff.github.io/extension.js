@@ -18,16 +18,19 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {RelayClient, ServiceClient} from './client.js';
-import {AccessDialog} from './dialogs.js';
+import {AccessDialog, ExchangeDialog} from './dialogs.js';
 import {fillMenu} from './menu.js';
 import * as Settings from './settings.js';
 import {duration, oneLine, targetName, where} from './text.js';
+import {VoiceClient, VoiceUnit} from './voice.js';
+import {VoiceSection, micFor} from './voice-menu.js';
 
 const ICON_LOCKED = 'changes-prevent-symbolic';
 const ICON_OPEN = 'changes-allow-symbolic';
 const ICON_FULL = 'dialog-warning-symbolic';
 const EXPIRY_WARNING = 5 * 60;      // seconds before a grant ends
 const TICK = 30;                    // seconds between updates of the times shown
+const UNIT_POLL = 1;                // seconds between looks at a unit that is changing
 
 function iconFor(state) {
     if (!state)
@@ -57,8 +60,11 @@ class PanelButton extends PanelMenu.Button {
             text: '', style_class: 'agent-relay-count', y_align: Clutter.ActorAlign.CENTER,
             visible: false,
         });
+        // The voice service: shown only while it runs.
+        this.mic = new St.Icon({style_class: 'system-status-icon', visible: false});
         box.add_child(this.icon);
         box.add_child(this.count);
+        box.add_child(this.mic);
         this.add_child(box);
     }
 });
@@ -107,15 +113,27 @@ export default class AgentRelayExtension extends Extension {
                 if (open) {
                     this._client.refresh();
                     this._refreshService();
+                    this._voice?.poke();
+                    this._refreshVoiceUnit();
                 }
             });
         }
 
+        this._voiceUnit = new VoiceUnit();
+        this._voiceSections = new Set();
+        this._voice = new VoiceClient(() => this._renderVoice());
+        // When the shell shuts down, the panel goes before disable() is called.
+        this._button.connect('destroy', () => {
+            this._voice?.destroy();
+            this._voice = null;
+        });
         this._client = new RelayClient(() => this._render(), event => this._onEvent(event));
         this._refreshService();
+        this._refreshVoiceUnit();
         this._tickId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, TICK, () => {
             this._client.refresh();
             this._refreshService();
+            this._refreshVoiceUnit();
             return GLib.SOURCE_CONTINUE;
         });
     }
@@ -124,6 +142,13 @@ export default class AgentRelayExtension extends Extension {
         if (this._tickId)
             GLib.source_remove(this._tickId);
         this._tickId = 0;
+        if (this._unitPollId)
+            GLib.source_remove(this._unitPollId);
+        this._unitPollId = 0;
+        this._voice?.destroy();
+        this._voice = null;
+        this._voiceUnit = null;
+        this._voiceSections = null;
         this._client?.destroy();
         this._client = null;
         this._dialog?.close();
@@ -135,6 +160,89 @@ export default class AgentRelayExtension extends Extension {
         this._source?.destroy();
         this._source = null;
         this._service = null;
+    }
+
+    // --- voice -------------------------------------------------------------------
+
+    // The unit's state from systemd: on the tick, when a menu opens, and every
+    // second while it is starting or stopping.
+    async _refreshVoiceUnit() {
+        const unit = this._voiceUnit;
+        if (!unit)
+            return;
+        const changed = await unit.refresh();
+        if (unit !== this._voiceUnit)
+            return;
+        if (changed) {
+            this._voice?.poke();
+            this._renderVoice();
+        }
+        if (unit.changing && !this._unitPollId) {
+            this._unitPollId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, UNIT_POLL, () => {
+                this._unitPollId = 0;
+                this._refreshVoiceUnit();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+    }
+
+    _renderVoice() {
+        if (!this._voice || !this._button)
+            return;
+        const mic = micFor(this._voice, this._voiceUnit);
+        const icon = this._button.mic;
+        icon.visible = mic !== null;
+        if (mic) {
+            icon.icon_name = mic[0];
+            for (const style of ['agent-relay-mic-idle', 'agent-relay-mic-hearing',
+                'agent-relay-mic-error'])
+                icon.remove_style_class_name(style);
+            if (mic[1])
+                icon.add_style_class_name(mic[1]);
+            icon.opacity = mic[1] === 'agent-relay-mic-idle' ? 128 : 255;
+        }
+        for (const section of this._voiceSections)
+            section.update();
+    }
+
+    _voiceUi() {
+        return {
+            voice: this._voice,
+            unit: this._voiceUnit,
+            // Shows the unit's real state afterwards, also when it failed.
+            setOn: on => this._run(this._voiceUnit.control(on ? 'start' : 'stop')
+                .finally(async () => {
+                    await this._refreshVoiceUnit();
+                    this._renderVoice();
+                }), 'Voice'),
+            run: (promise, what) => this._run(promise, what),
+            showExchange: () => this._showExchange(),
+        };
+    }
+
+    // A new submenu for a menu being filled; kept up to date until destroyed.
+    _voiceSection() {
+        const section = new VoiceSection(this._voiceUi());
+        this._voiceSections.add(section);
+        section.item.connect('destroy', () => this._voiceSections?.delete(section));
+        return section.item;
+    }
+
+    _showExchange() {
+        const state = this._voice?.state;
+        if (!state)
+            return;
+        this._closeMenus();
+        this._dialog?.close();
+        this._dialog = new ExchangeDialog(state.last_user, state.last_assistant);
+        this._dialog.connect('closed', () => (this._dialog = null));
+        this._dialog.open();
+    }
+
+    _closeMenus() {
+        this._button.menu.close();
+        this._indicator.toggle.menu.close();
+        Main.panel.statusArea.quickSettings.menu.close();
     }
 
     // --- showing the state ---------------------------------------------------
@@ -177,6 +285,7 @@ export default class AgentRelayExtension extends Extension {
             grantDialog: (target, kind = '') => this._openDialog({target, kind}),
             approveDialog: (request, kind = '') => this._openDialog({request, kind}),
             run: (promise, what) => this._run(promise, what),
+            voiceSection: () => this._voiceSection(),
             notifyActivity: this._settings.notifyActivity,
             setNotifyActivity: on => {
                 this._settings.notifyActivity = on;
@@ -187,9 +296,7 @@ export default class AgentRelayExtension extends Extension {
     }
 
     _openDialog(what) {
-        this._button.menu.close();
-        this._indicator.toggle.menu.close();
-        Main.panel.statusArea.quickSettings.menu.close();
+        this._closeMenus();
         if (!this._client?.state)
             return;
         this._dialog = new AccessDialog(this._client, what,

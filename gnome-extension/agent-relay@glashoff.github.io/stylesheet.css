@@ -7,3 +7,8 @@
 .agent-relay-count { font-weight: bold; padding-left: 2px; }
 .agent-relay-dialog { spacing: 12px; max-width: 32em; }
 .agent-relay-dialog .button.selected { background-color: -st-accent-color; color: -st-accent-fg-color; }
+.agent-relay-mic-hearing { color: -st-accent-color; }
+.agent-relay-mic-error { color: #f8b84e; }
+.agent-relay-exchange { spacing: 6px; }
+.agent-relay-exchange .agent-relay-message { max-width: 30em; }
+.agent-relay-exchange-scroll { max-height: 24em; }

@@ -45,7 +45,7 @@ function heading(text) {
 }
 
 // ui: {client, serviceState, controlService(verb), grantDialog(target, kind),
-//      approveDialog(request), run(promise, what), close()}
+//      approveDialog(request), run(promise, what), voiceSection(), ...}
 export function fillMenu(menu, ui) {
     menu.removeAll();
     const state = ui.client.state;
@@ -66,8 +66,12 @@ export function fillMenu(menu, ui) {
     if (!reachable)
         lines.push(['Nothing can be approved while it is not running.', 'agent-relay-dim']);
     menu.addMenuItem(block(lines, serviceButtons));
-    if (!reachable)
+    if (!reachable) {
+        // Voice works without the relay; it only cannot hand on work.
+        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        menu.addMenuItem(ui.voiceSection());
         return;
+    }
 
     // Requests waiting for approval
     if (state.requests.length) {
@@ -197,6 +201,7 @@ export function fillMenu(menu, ui) {
         ui.notifyActivity);
     notify.connect('toggled', (_item, on) => ui.setNotifyActivity(on));
     menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    menu.addMenuItem(ui.voiceSection());
     menu.addMenuItem(notify);
 
     if (state.grants.length)
