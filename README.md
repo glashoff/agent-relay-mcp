@@ -25,9 +25,9 @@ Five tools:
 | Tool | What it does |
 |---|---|
 | `list_projects` | The folders in your projects directory, with whether their container runs, Claude Code is working, a reply is waiting, and whether they are approved |
-| `send_message(project, message, new_conversation=false, wait_seconds=0, run_on_host=false)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. While Claude Code works, the message is passed into the running request, or queued as the next one. Returns at once, unless `wait_seconds` is set. `run_on_host=true` only asks to run a project with a dev container on the host instead: it waits for approval with the full-access warning |
-| `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps), or the final reply |
-| `stop(project)` | Ends the current request; the conversation is kept |
+| `send_message(project, message, new_conversation=false, wait_seconds=0, run_on_host=false)` | Passes a request to Claude Code in that project, continuing the project's conversation; starts the dev container if needed. Claude Code stays open between messages, so the message is passed straight in, also while it works; only while it is being started is it queued for a moment. Returns at once, unless `wait_seconds` is set. `run_on_host=true` only asks to run a project with a dev container on the host instead: it waits for approval with the full-access warning |
+| `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps, and the reply so far if Claude Code answered and works on in the background), or the final reply |
+| `stop(project)` | Ends the current request (or Claude Code waiting for the next message); the conversation is kept |
 | `release_access(project="", all_projects=false)` | Ends your approval for a project (or all) when you say you are done, so it is locked again; refused while Claude Code still works there. It can only take access away |
 
 Requests to a coding agent take minutes, but Claude's apps give up on a tool
@@ -70,8 +70,9 @@ agent-relay-ctl watch                  # events as they come
   host until you approve it with "full access" (or approve it for the dev
   container instead), and a grant for the dev container never becomes one
   for the host this way.
-- **Revoking** lets a running request finish; messages queued for it wait for
-  approval again. `--stop` ends it.
+- **Revoking** lets a running request finish (background tasks included) and
+  then ends Claude Code there; messages queued for it wait for approval
+  again. `--stop` ends it at once.
 - `agent-relay-ctl` asks for a confirmation typed on the terminal, and the
   relay accepts grants only from GNOME Shell or a process with a terminal, so
   Claude Code started by the relay cannot approve anything. Grants are kept in
@@ -117,8 +118,9 @@ and leaves screenshots; it touches nothing of the running session.
 
 ### Keeping the computer awake
 
-While a request runs (and five minutes after), the relay keeps the computer
-from going to sleep by idling, through a systemd-logind inhibitor. Other modes:
+While a request runs, background tasks included (and five minutes after), the
+relay keeps the computer from going to sleep by idling (Claude Code waiting
+for the next message does not count), through a systemd-logind inhibitor. Other modes:
 off, or while anything is approved; and optionally also with the lid closed
 (it gets warm in a bag). It lets go on battery below 20 %.
 
@@ -129,7 +131,8 @@ project folder, `.relay/log.md`: what the chat sent (and messages passed in or
 queued, requests waiting for approval), Claude Code's steps, what it says in
 between, its thinking as short summaries, and the replies. It reads the
 output every two seconds while a request runs, so the log is current without
-anyone asking. Open the file in VS Code and use *Open Preview to the Side*
+anyone asking. Each message that starts a request gets a "Request" header of
+its own, also when it goes into a Claude Code that is still open. Open the file in VS Code and use *Open Preview to the Side*
 (Ctrl+K V): the preview follows the file as it grows.
 
 - `.relay/.gitignore` (containing `*`) keeps it out of git, without changes to
@@ -146,25 +149,41 @@ anyone asking. Open the file in VS Code and use *Open Preview to the Side*
 
 ## How it works
 
-- **One conversation per project.** Each request is one `claude -p` run with
-  `--input-format stream-json --output-format stream-json`; follow-ups
-  continue the same session with `--resume`.
-- **Messages while it works.** A run reads its input from a FIFO in its run
-  directory, so a message sent while Claude Code works is passed into the
-  running request, and Claude Code takes it into account at its next step, as
-  when typing ahead in the IDE. A small shell loop next to the run closes the
-  FIFO once a result has come after the last message passed in, which ends
-  the run. A message that cannot be passed in (the container is still
-  starting, or the run is already ending) is queued and sent as the next
-  request in the same conversation as soon as the run has ended; a reply
-  nobody picked up in between is reported along with the next one. `stop`
-  drops the queue. Runs need `flock`, `timeout` and `mkfifo` in the container
-  (util-linux and coreutils).
+- **One conversation per project, kept open.** A conversation is one
+  `claude -p` run with `--input-format stream-json --output-format
+  stream-json` that stays open between messages; a new run continues the same
+  session with `--resume`. Details: `docs/conversation-plan.md`.
+- **Messages go straight in.** A run reads its input from a FIFO in its run
+  directory, which a small shell loop next to it keeps open, so every message
+  is passed into the open run: while Claude Code works, it takes it into
+  account at its next step, as when typing ahead in the IDE; while it waits,
+  it starts on it. Only while the run is being started (or is just ending) is
+  a message queued, and sent as soon as possible; a reply nobody picked up in
+  between is reported along with the next one. `stop` drops the queue.
+- **Done is not the end.** A request is done once a result has come after the
+  last message and no background task of Claude Code's (a subagent or a
+  command run in the background) is open; when one ends, Claude Code takes up
+  its result in a pass of its own, which belongs to the same request.
+  Background tasks keep the run open and count as work (for the idle time of
+  approvals and for keeping the computer awake); a run that only waits for
+  the next message does not. `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` is set,
+  so Claude Code never kills background tasks after ten minutes when its
+  input ends.
+- **When a run ends.** The relay closes the run's input, Claude Code finishes
+  what it has and exits, when nothing was sent for `conversation_idle_minutes`
+  (15 by default, with no background task open), when no approval covers it
+  any more (after revoking: once it is done), on `stop`, `release_access`, a
+  switch between dev container and host, or a new conversation. While a run
+  is open, a `claude` process runs in the dev container, so an idle-stop of
+  the container that counts Claude Code as activity keeps it up until then.
+  Runs need `flock`, `timeout` and `mkfifo` in the container (util-linux and
+  coreutils).
 - **Runs are detached.** A run is started with `setsid` inside the container
   and writes to files under `~/.cache/agent-relay-mcp/<run>/` there. Restarting
   this server, a dropped tunnel or a phone that never asks again does not stop
-  it; the server keeps only the ids (in `~/.local/state/agent-relay-mcp/`) and
-  reads the output again when asked. Run directories older than 7 days are
+  it, and it stays open: the restarted server finds it again from the ids it
+  keeps (in `~/.local/state/agent-relay-mcp/`), passes the next message into
+  it and reads the output again. Run directories untouched for 7 days are
   removed. A run on this machine (a project without a dev container, or one
   approved to run on the host) is started in a systemd scope of its own
   (`systemd-run --user --scope`) when the relay runs as a systemd service;
