@@ -35,9 +35,14 @@ How to use it:
   complete and unambiguous, including what you already know from the
   conversation. Do not invent requirements.
 - send_message returns at once. Tell the user that Claude Code is working on it.
-- Additions and corrections for a request still in progress go through
-  send_message too. They are passed into the running request, or queued and
-  sent right after it; the reply says which. Tell the user.
+- Additions, corrections and follow-ups go through send_message too. Claude
+  Code stays open in the project's conversation between messages, so they are
+  passed straight in, also while it is still working, and it takes them into
+  account at its next step. Only while it is being started is a message
+  queued for a moment; the reply says what happened.
+- Claude Code may answer and go on working in the background (a subagent, a
+  long command). get_updates then shows its reply so far and that it is still
+  working; the request is finished once the background work is done too.
   Do not call get_updates on your own in a loop; call it when the user asks
   how it is going, or when they come back to the topic.
 - Report results the way the user needs them. In a voice conversation, give a
@@ -113,10 +118,10 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         "Sends a message to Claude Code in a project: a new task, a follow-up, or the "
         "answer to a question Claude Code asked. Continues that project's conversation "
         "unless new_conversation is true. Starts the project's dev container if needed. "
-        "While Claude Code is working, the message is passed into the running request, "
-        "which takes it into account at its next step; if that is not possible, it is "
-        "queued and sent as the next request once the current one has finished. The "
-        "reply says which happened. "
+        "Claude Code stays open in the conversation between messages: the message is "
+        "passed straight in, also while Claude Code is still working (it takes it into "
+        "account at its next step); only while Claude Code is being started is it queued "
+        "for a moment. The reply says which happened. "
         "Returns immediately by default; most requests take minutes, so tell the user it "
         "is in progress and fetch the result later with get_updates. Only for requests "
         f"that are obviously quick, set wait_seconds (at most {max_wait}) to wait for "
@@ -143,8 +148,9 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
 
     @server.tool(description=(
         "Gets the state of the latest request to Claude Code in a project: still working "
-        "(with its recent steps), or finished with its final reply. Returns at once by "
-        f"default; wait_seconds (at most {max_wait}) waits for the reply first."))
+        "(with its recent steps, and its reply so far if it answered and works on in the "
+        "background), or finished with its final reply. Returns at once by default; "
+        f"wait_seconds (at most {max_wait}) waits for the reply first."))
     async def get_updates(
         project: ProjectName,
         wait_seconds: Annotated[int, Field(ge=0, le=60, description=(
@@ -152,8 +158,9 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
     ) -> str:
         return await guarded(relay.get_updates(project, wait_seconds))
 
-    @server.tool(description="Stops the request Claude Code is working on in a project. "
-                             "The conversation is kept, so it can be continued.")
+    @server.tool(description="Stops the request Claude Code is working on in a project "
+                             "(or ends Claude Code there if it only waits for the next "
+                             "message). The conversation is kept, so it can be continued.")
     async def stop(project: ProjectName) -> str:
         return await guarded(relay.stop(project))
 

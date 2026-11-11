@@ -41,7 +41,8 @@ allow_host_projects = false
 start_command = ["devcontainer", "up", "--workspace-folder", "{project}"]
 start_timeout = 600
 
-# How Claude Code is run. Each message is one `claude -p` run, continuing the
+# How Claude Code is run: one `claude -p` run per conversation, kept open
+# between messages (see conversation_idle_minutes); a new run continues the
 # project's conversation with --resume. Claude Code must be installed and
 # signed in where it runs (in the container: for example with a token from
 # `claude setup-token` in CLAUDE_CODE_OAUTH_TOKEN).
@@ -50,6 +51,17 @@ permission_mode = "auto"      # nobody is there to answer permission prompts
 model = ""                    # empty: Claude Code's default
 # append_system_prompt = "..."  # default: tells Claude Code that its reply is relayed
 extra_args = []
+
+# Claude Code stays open in a project's conversation after a request, so the
+# next message goes straight in and background tasks (subagents, long
+# commands) can finish. Its run is closed after this many minutes with no
+# message and no background task open (also when the approval ends, on stop,
+# release, a switch between dev container and host, or a new conversation);
+# the next message then resumes the conversation in a new run. While a run is
+# open, a `claude` process runs in the dev container, which keeps an idle-stop
+# of the container from stopping it until then. 0: close right after each
+# request.
+conversation_idle_minutes = 15
 
 # Longest wait a tool call may ask for, in seconds. Claude's apps give up on a
 # tool call somewhere between 20 and 60 seconds.

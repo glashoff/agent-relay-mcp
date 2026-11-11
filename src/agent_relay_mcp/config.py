@@ -51,6 +51,12 @@ class Config:
     append_system_prompt: str = DEFAULT_SYSTEM_PROMPT
     extra_args: list[str] = field(default_factory=list)
 
+    # Claude Code stays open between messages; this long after a request is
+    # done with nothing new sent (and no background task open), its run is
+    # closed, and the next message resumes the conversation in a new run.
+    # 0: close it as soon as a request is done.
+    conversation_idle_minutes: int = 15
+
     # Longest wait a tool call may ask for. Claude's apps give up on tool calls
     # somewhere between 20 and 60 seconds.
     max_wait_seconds: int = 15
@@ -139,6 +145,8 @@ def load(path: Path | None = None) -> Config:
                 "max_all_grant_hours", "max_host_grant_hours"):
         if getattr(config, key) < 1:
             raise SystemExit(f"{path}: {key} must be at least 1")
+    if config.conversation_idle_minutes < 0:
+        raise SystemExit(f"{path}: conversation_idle_minutes must be 0 or more")
     return config
 
 

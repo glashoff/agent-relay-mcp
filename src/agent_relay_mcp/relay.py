@@ -1,16 +1,22 @@
-"""One Claude Code conversation per project, one detached claude -p run per request.
+"""One Claude Code conversation per project, kept open as one detached claude -p run.
 
 A run is started detached from everything this server holds (setsid, output to
 a file in the run's own directory), so it survives a restart of this server, a
 dropped tunnel or a phone call that never comes back. The server only keeps
 what it needs to find the run again: its id, and the conversation's session id.
 
-Messages sent while a run works are passed into it: the run reads stream-json
-from a FIFO, and Claude Code takes a message that arrives there into account at
-its next step. A small shell loop next to the run closes the FIFO once a result
-has come after the last message passed in, so the run ends. Messages that
-cannot be passed in (the run is still being started, or is already ending) are
-queued here and sent as the next request once the run has ended.
+A run reads stream-json from a FIFO, which a small shell loop next to it keeps
+open, so it stays open for the next message: every message sent while it is
+open is passed in, and Claude Code takes it into account at its next step or
+starts working on it. A request (a Turn here) is done once a result has come
+after the last message passed in and no background task of Claude Code's
+(a subagent or shell run in the background) is still open; the run then
+waits for the next message. The relay closes the FIFO, which ends the run,
+when nothing was sent for conversation_idle_minutes, when no grant covers it
+any more, on stop, release, a switch between dev container and host, or a new
+conversation (see docs/conversation-plan.md). Messages that cannot be passed
+in (the run is still being started, or is already ending) are queued here and
+sent once that is possible.
 
 Nothing runs without a grant (access.py). A message to a project no grant
 covers becomes a request that waits for approval at the laptop; grants and
@@ -53,11 +59,16 @@ SWEEP_SECONDS = 10         # how often grants, requests and switches are checked
 RUN_ROOT = '"$HOME/.cache/agent-relay-mcp"'
 KEEP_RUNS_DAYS = 7
 
-# Phases of a turn.
+# Phases of a turn (one request: a message, the messages passed in while it
+# works, and Claude Code's work on them).
 STARTING = "starting"      # container start and launch still in progress here
-RUNNING = "running"
-FINISHED = "finished"      # Claude Code ended and left a result
+RUNNING = "running"        # Claude Code works on it, or a background task is open
+FINISHED = "finished"      # done, with a result; the run may stay open (Turn.ended)
 FAILED = "failed"          # it never started, crashed, or was stopped
+
+_STATE_FIELDS = ("id", "message", "started", "phase", "error", "delivered", "resumed",
+                 "born", "passed_in", "earlier_reply", "pid", "logged", "run", "base",
+                 "mark", "done_at", "done_pos", "ended", "closed", "close_reason")
 
 
 @dataclass
@@ -75,7 +86,7 @@ class Turn:
     output: TurnOutput = field(default_factory=TurnOutput)
     offset: int = 0            # bytes of out.jsonl already fed to output
     # The output is not stored in state.json. After a restart it is read again
-    # from the run, but only when needed: a reply not yet reported.
+    # from the run (from base on), but only when needed.
     output_loaded: bool = True
     logged: int = 0            # bytes of out.jsonl already in the project's log
     # The last text Claude Code wrote, held back from the log until it is
@@ -83,17 +94,45 @@ class Turn:
     # and where its line starts in out.jsonl (the log is "logged" up to there).
     pending_text: str = ""
     pending_start: int = -1
-    closed: bool = False       # the run takes no more messages
+    # The run (Claude Code process and its directory) this turn is in. Every
+    # turn of an open run shares it; "" for the turn that started the run.
+    run: str = ""
+    base: int = 0              # where in out.jsonl this turn's output starts
+    mark: int = 0              # size of out.jsonl when the last message was passed in
+    done_at: float = 0.0       # when it was done (Relay.clock), for the idle timeout
+    done_pos: int = 0          # how far out.jsonl was read then
+    ended: bool = False        # the run has ended (Claude Code exited)
+    closed: bool = False       # the run takes no more messages (it is ending)
+    close_reason: str = ""
     # The process id of the run, as seen at launch. The run directory is
     # writable where the run is, so its pid file is not trusted.
     pid: int = 0
 
+    @property
+    def run_id(self) -> str:
+        return self.run or self.id
+
+    @property
+    def working(self) -> bool:
+        return self.phase in (STARTING, RUNNING)
+
+    @property
+    def open(self) -> bool:
+        """Done, and its run waits for the next message."""
+        return self.phase == FINISHED and not self.ended and not self.closed
+
     def to_state(self) -> dict:
-        return {"id": self.id, "message": self.message, "started": self.started,
-                "phase": self.phase, "error": self.error, "delivered": self.delivered,
-                "resumed": self.resumed, "born": self.born, "passed_in": self.passed_in,
-                "earlier_reply": self.earlier_reply, "pid": self.pid,
-                "logged": self.logged}
+        return {name: getattr(self, name) for name in _STATE_FIELDS}
+
+    @classmethod
+    def from_state(cls, data: dict) -> "Turn":
+        turn = cls(**{k: v for k, v in data.items() if k in _STATE_FIELDS},
+                   output_loaded=False)
+        if "ended" not in data:
+            # Written before runs stayed open: a turn that was over had ended.
+            turn.ended = turn.phase in (FINISHED, FAILED)
+        turn.offset = turn.base
+        return turn
 
 
 @dataclass
@@ -109,31 +148,33 @@ class Conversation:
 
 
 # Runs next to Claude Code, as its parent: feeds it the first message through
-# the FIFO "in", keeps the FIFO open for messages passed in later, and closes it
-# once a result has come after the last of them ("mark" holds the number of
-# results when that one was passed in). Messages still in the FIFO then are
-# read before the end of input, so none is lost. "lock" makes passing a
-# message in and closing exclusive.
+# the FIFO "in" and keeps the FIFO open (fd 3) for the messages passed in
+# later, until the relay asks it to close by creating the file "close". The
+# relay creates "close" and passes messages in only while it holds "lock",
+# and refuses to pass one in once "close" exists, so a message is either in
+# the FIFO before it closes, and Claude Code reads it before the end of
+# input, or refused. After the end of input Claude Code finishes what it has
+# (background tasks included: CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 keeps it
+# from killing them after ten minutes) and exits. The runner lives on its
+# own, so the run outlives a restart of the relay. POSIX sh: it also runs in
+# dev containers.
 _RUNNER = """
 d=$0
 echo $$ > "$d/pid"
+CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS
 "$@" < "$d/in" > "$d/out.jsonl" 2> "$d/err.log" &
 c=$!
 exec 3> "$d/in"
 cat "$d/prompt" >&3
-exec 9> "$d/lock"
 while kill -0 "$c" 2>/dev/null; do
-    sleep 1
-    flock 9 2>/dev/null
-    r=$(grep -c '"type": *"result"' "$d/out.jsonl" 2>/dev/null)
-    if [ "${r:-0}" -gt "$(cat "$d/mark")" ]; then
+    if [ -e "$d/close" ]; then
         : > "$d/closed"
         exec 3>&-
         break
     fi
-    flock -u 9 2>/dev/null
+    sleep 1
 done
-flock -u 9 2>/dev/null
 wait "$c"
 echo $? > "$d/exit"
 """
@@ -197,6 +238,8 @@ class Relay:
         self.sweeper: asyncio.Task | None = None
         self.subscribers: set[asyncio.Queue] = set()
         self.clock = time.time
+        # Seconds an open run waits for the next message before it is closed.
+        self.conversation_idle = config.conversation_idle_minutes * 60
         self.access = Access(config.state_dir / "access.json", Limits(
             idle=config.grant_idle_minutes * 60,
             request_expiry=config.request_expiry_minutes * 60,
@@ -233,7 +276,7 @@ class Relay:
             conversation = Conversation(entry.get("session_id", ""),
                                         queue=entry.get("queue") or [], on_host=on_host)
             if turn:
-                conversation.turn = Turn(**turn, output_loaded=False)
+                conversation.turn = Turn.from_state(turn)
                 if conversation.turn.phase == STARTING:
                     # The launch was cut off by the restart; the run may or may
                     # not exist. Polling finds it running, finished or missing.
@@ -294,9 +337,28 @@ class Relay:
                                  "first.")
             log.warning("%s now runs %s; starting a new conversation there", project.name,
                         "on the host" if on_host else "in its dev container")
+            turn = conversation.turn
+            if turn and not turn.ended:
+                # Its run is open in the old place: it is closed there and
+                # not followed any more.
+                task = asyncio.create_task(self._close_elsewhere(project, conversation.on_host,
+                                                                 turn))
+                self.background.add(task)
+                task.add_done_callback(self.background.discard)
+                turn.closed, turn.ended = True, True
+                turn.close_reason = "the project's place changed"
             conversation.on_host = on_host
             conversation.session_id = ""
         return conversation
+
+    async def _close_elsewhere(self, project: Project, on_host: bool, turn: Turn) -> None:
+        try:
+            target = await asyncio.to_thread(targets.target_for, self.config, project,
+                                             start=False, on_host=on_host)
+            if target:
+                await asyncio.to_thread(self._close, target, turn)
+        except RelayError as error:
+            log.warning("closing the old run of %s failed: %s", project.name, error)
 
     def _project_conversations(self, project: Project) -> list[tuple[str, Conversation]]:
         """(kind, conversation) for the kinds project has conversations in."""
@@ -362,19 +424,24 @@ class Relay:
         return args + c.extra_args
 
     def _launch(self, target: Target, turn: Turn, session_id: str, resume: bool) -> None:
-        d = _run_dir(turn.id)
+        d = _run_dir(turn.run_id)
         claude = " ".join(shlex.quote(a) for a in self._claude_args(session_id, resume))
         # The prompt goes in through stdin, so no length limit and no quoting.
         # setsid: its own session, so a stop can end the whole process group,
         # and nothing here waits for it.
+        # Old run directories go, unless something in them is still written
+        # to: a run that stays open for long keeps an old directory.
         script = f"""
 set -e
-find {RUN_ROOT} -mindepth 1 -maxdepth 1 -mtime +{KEEP_RUNS_DAYS} -exec rm -rf {{}} + 2>/dev/null || true
+find {RUN_ROOT} -mindepth 1 -maxdepth 1 -type d -mtime +{KEEP_RUNS_DAYS} 2>/dev/null |
+while read -r old; do
+    new=$(find "$old" -mindepth 1 -mtime -{KEEP_RUNS_DAYS + 1} 2>/dev/null | head -n 1)
+    [ -n "$new" ] || rm -rf "$old"
+done || true
 d={d}
 mkdir -p "$d"
 cat > "$d/prompt"
 mkfifo "$d/in"
-echo 0 > "$d/mark"
 {self._scope(target, turn)}setsid sh -c {shlex.quote(_RUNNER)} "$d" {claude} < /dev/null > /dev/null 2>&1 &
 # The runner writes its own pid: setsid, or the scope, may have forked.
 for i in $(seq 1 100); do [ -s "$d/pid" ] && break; sleep 0.05; done
@@ -397,55 +464,82 @@ echo "PID $(cat "$d/pid" 2>/dev/null)"
                 or not os.environ.get("INVOCATION_ID") or not shutil.which("systemd-run"):
             return ""
         return (f"systemd-run --user --scope --quiet --collect "
-                f"--unit=agent-relay-run-{turn.id} -- ")
+                f"--unit=agent-relay-run-{turn.run_id} -- ")
 
-    def _pass_in(self, target: Target, turn: Turn, message: str) -> bool:
-        """Passes message into the running run; False if it takes none any more
-        (it is ending, or was started before runs could take messages)."""
-        d = _run_dir(turn.id)
+    def _pass_in(self, target: Target, turn: Turn, message: str) -> int | None:
+        """Passes message into the open run: the size of its output then (what
+        comes after it answers the message), or None if it takes no messages
+        any more (it is ending, or has ended)."""
+        d = _run_dir(turn.run_id)
+        # "mark" is for runs started by the relay before runs stayed open:
+        # their runner closes the FIFO once there are more results than that.
         script = f"""
 d={d}
 [ -p "$d/in" ] || {{ echo CLOSED; exit 0; }}
 exec 9> "$d/lock"
 flock -w 10 9 2>/dev/null
 {_pid(turn)}
-if [ -e "$d/closed" ] || [ -e "$d/exit" ] || [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+if [ -e "$d/close" ] || [ -e "$d/closed" ] || [ -e "$d/exit" ] || [ -z "$p" ] \\
+        || ! kill -0 "$p" 2>/dev/null; then
     echo CLOSED; exit 0
 fi
 r=$(grep -c '"type": *"result"' "$d/out.jsonl" 2>/dev/null)
+s=$(wc -c < "$d/out.jsonl" 2>/dev/null | tr -d ' ')
 if timeout 10 sh -c 'cat > "$0/in"' "$d"; then
-    echo "${{r:-0}}" > "$d/mark"
-    echo PASSED
+    [ -e "$d/mark" ] && echo "${{r:-0}}" > "$d/mark"
+    echo "PASSED ${{s:-0}}"
 fi
 """
         result = targets.run_in(self.config, target, script, stdin=_user_message(message))
-        if result.stdout.strip() == b"PASSED":
-            return True
+        answer = result.stdout.decode(errors="replace").split()
+        if len(answer) == 2 and answer[0] == "PASSED" and answer[1].isdigit():
+            return int(answer[1])
         turn.closed = True
-        return False
+        return None
+
+    def _close(self, target: Target, turn: Turn) -> None:
+        """Asks the run's runner to close its input, so Claude Code finishes
+        and exits. Under the lock, so no message is passed in meanwhile."""
+        d = _run_dir(turn.run_id)
+        script = f"""
+d={d}
+[ -d "$d" ] || exit 0
+exec 9> "$d/lock"
+flock -w 10 9 2>/dev/null
+: > "$d/close"
+"""
+        targets.run_in(self.config, target, script)
 
     def _poll(self, target: Target, turn: Turn) -> None:
-        """Reads what the run has written since the last poll, and its state."""
-        d = _run_dir(turn.id)
+        """Reads what the run has written since the last poll, and its state:
+        whether the turn is done (a result after the last message passed in,
+        no background task open) and whether the run has ended."""
+        d = _run_dir(turn.run_id)
         script = f"""
 d={d}
 {_pid(turn)}
-if [ -f "$d/exit" ]; then echo "EXIT $(head -c 20 "$d/exit" | tr -d '\n')"
-elif [ -z "$p" ]; then echo MISSING
-elif kill -0 "$p" 2>/dev/null; then echo RUNNING
-else echo GONE; fi
+if [ -f "$d/exit" ]; then s="EXIT $(head -c 20 "$d/exit" | tr -d '\n ')"
+elif [ -z "$p" ]; then s=MISSING
+elif kill -0 "$p" 2>/dev/null; then s=RUNNING
+else s=GONE; fi
+if [ -e "$d/closed" ] || [ -e "$d/close" ]; then echo "$s closed"; else echo "$s"; fi
 tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
 """
         result = targets.run_in(self.config, target, script)
         status, _, data = result.stdout.partition(b"\n")
         status = status.decode(errors="replace").strip()
+        if status.endswith(" closed"):
+            # Also for a run whose runner closed it on its own (started
+            # before runs stayed open), or a close the state lost.
+            status = status.removesuffix(" closed")
+            turn.closed = True
         _, used = complete_lines(data)
         position = turn.offset
         entries = []
         for raw in data[:used].split(b"\n")[:-1]:
             start = position
             position += len(raw) + 1
-            turn.output.feed(raw.decode("utf-8", errors="replace"))
+            turn.output.feed(raw.decode("utf-8", errors="replace"), start)
             items, turn.output.items = turn.output.items, []
             if position > turn.logged:      # not in the log yet (also after a restart)
                 entries += [self._log_entry(turn, item, start) for item in items]
@@ -456,19 +550,35 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
         turn.output_loaded = True
         turn.born = turn.born or bool(turn.output.session_id)
         if status == "RUNNING":
-            turn.phase = RUNNING
+            if was == FINISHED and turn.output.work_at < turn.done_pos:
+                pass            # still done: nothing new since (also after a restart)
+            elif turn.output.done(turn.mark):
+                turn.phase = FINISHED
+            else:
+                turn.phase = RUNNING        # working, or working again
         elif status.startswith("EXIT") or status == "GONE":
-            if turn.output.result is not None:
+            turn.ended = True
+            if was == FINISHED or turn.output.result is not None:
                 turn.phase = FINISHED
             else:
                 turn.phase = FAILED
                 turn.error = "Claude Code ended without a reply. " + self._stderr(target, turn)
         elif status == "MISSING":
-            turn.phase = FAILED
-            turn.error = "The run is gone from the container (was it rebuilt?)."
-        else:
+            turn.ended = True
+            if was != FINISHED:
+                turn.phase = FAILED
+                turn.error = "The run is gone from the container (was it rebuilt?)."
+        elif was != FINISHED:
             turn.phase = FAILED
             turn.error = "Cannot read the run: " + result.stderr.decode(errors="replace")[-500:]
+        # Claude Code began a pass of its own after the turn was done (a
+        # message that came just after the result, a background task the
+        # turn did not know of): the turn is not reported as done any more.
+        reopened = was == FINISHED and turn.output.work_at >= turn.done_pos > 0
+        if reopened:
+            turn.delivered = False
+        if turn.phase == FINISHED and (was != FINISHED or reopened):
+            turn.done_at, turn.done_pos = self.clock(), turn.offset
         if turn.phase != RUNNING:
             entries.append(self._flush_text(turn))
         if turn.phase == FAILED and was in (STARTING, RUNNING):
@@ -521,11 +631,12 @@ tail -c +{turn.offset + 1} "$d/out.jsonl" 2>/dev/null | head -c {READ_LIMIT}
         project_log_.write(text, new_request=new_request)
 
     def _stderr(self, target: Target, turn: Turn) -> str:
-        result = targets.run_in(self.config, target, f'tail -c 1500 {_run_dir(turn.id)}/err.log')
+        result = targets.run_in(self.config, target,
+                                f'tail -c 1500 {_run_dir(turn.run_id)}/err.log')
         return result.stdout.decode(errors="replace").strip()
 
     def _stop(self, target: Target, turn: Turn) -> None:
-        d = _run_dir(turn.id)
+        d = _run_dir(turn.run_id)
         script = f"""
 d={d}
 {_pid(turn)}
@@ -543,24 +654,53 @@ kill -KILL -- "-$p" 2>/dev/null || true
 
     # --- refreshing ---------------------------------------------------------
 
+    @staticmethod
+    def _answered(turn: Turn) -> bool:
+        """Whether a working turn has a result after its last message: Claude
+        Code replied, and goes on with background tasks."""
+        return turn.phase == RUNNING and 0 <= turn.mark <= turn.output.result_at
+
+    @staticmethod
+    def _watched(turn: Turn | None) -> bool:
+        """Whether the run of turn is read: it works, or it is done and its
+        run has not ended yet (it waits for messages, or is ending)."""
+        return bool(turn) and (turn.phase == RUNNING
+                               or (turn.phase == FINISHED and not turn.ended))
+
     async def _refresh(self, project: Project, conversation: Conversation) -> None:
         turn = conversation.turn
-        if not turn or turn.phase not in (RUNNING,):
+        if not self._watched(turn):
             return
         target = await asyncio.to_thread(self._target, project, conversation, start=False)
-        logged = turn.logged
+        logged, was, ended = turn.logged, turn.phase, turn.ended
+        delivered, closed = turn.delivered, turn.closed
         if target is None:
-            turn.phase = FAILED
-            turn.error = "The project's dev container is not running any more."
+            if turn.phase == RUNNING:
+                turn.phase = FAILED
+                turn.error = "The project's dev container is not running any more."
+            turn.ended = True
         else:
             await asyncio.to_thread(self._poll, target, turn)
         if turn.output.session_id:
             conversation.session_id = turn.output.session_id
-        if turn.phase != RUNNING or turn.logged != logged:
+        if (turn.phase, turn.ended, turn.delivered, turn.closed) != (was, ended, delivered,
+                                                                     closed) \
+                or turn.logged != logged:
             self._save()        # also how far the log is, so a restart adds nothing twice
-        if turn.phase != RUNNING:
-            self._emit("run_ended", project=project.name,
-                       kind=self._kind_of(project, conversation), phase=turn.phase)
+        kind = self._kind_of(project, conversation)
+        if was == RUNNING and turn.phase != RUNNING:
+            # The request is done (or failed); "open": the run waits for more.
+            self._emit("run_ended", project=project.name, kind=kind, phase=turn.phase,
+                       open=turn.open)
+            self._update_keep_awake()
+        elif was == FINISHED and turn.phase == RUNNING:
+            log.info("%s: Claude Code works again on its own", _key(project, kind))
+            self._update_keep_awake()
+            self._follow(_key(project, kind))
+        if turn.ended and not ended:
+            reason = turn.close_reason or ("exited" if turn.phase == FINISHED else turn.phase)
+            log.info("%s: the run ended (%s)", _key(project, kind), reason)
+            self._emit("process_ended", project=project.name, kind=kind, reason=reason)
 
     async def _refresh_all(self, project: Project) -> None:
         for _, conversation in self._project_conversations(project):
@@ -583,26 +723,33 @@ kill -KILL -- "-$p" 2>/dev/null || true
         return True
 
     async def _check(self, project: Project) -> None:
-        """For list_projects: whether a turn that is running still is. Skipped
-        while another call works on the project; that one keeps it current."""
+        """For list_projects and the sweeper: whether a turn that is running
+        still is, and whether an open run still is. Skipped while another call
+        works on the project; that one keeps it current."""
         lock = self._lock(project.name)
-        running = [c for _, c in self._project_conversations(project)
-                   if c.turn and c.turn.phase == RUNNING]
-        if not running or lock.locked():
+        watched = [c for _, c in self._project_conversations(project)
+                   if self._watched(c.turn)]
+        if not watched or lock.locked():
             return
         async with lock:
             try:
-                for conversation in running:
+                for conversation in watched:
                     await self._refresh(project, conversation)
             except RelayError as error:
                 log.warning("checking %s failed: %s", project.name, error)
 
-    async def _wait(self, project: Project, conversation: Conversation, seconds: int) -> None:
+    async def _wait(self, project: Project, conversation: Conversation, seconds: int,
+                    answered_after: int | None = None) -> None:
+        """Waits up to seconds for the turn to be done; with answered_after,
+        also returns once a result came after that point of the output (the
+        answer to a message passed in, while background tasks still run)."""
         deadline = time.monotonic() + max(0, min(seconds, self.config.max_wait_seconds))
         while True:
             await self._refresh(project, conversation)
             turn = conversation.turn
             if not turn or turn.phase in (FINISHED, FAILED) or time.monotonic() >= deadline:
+                return
+            if answered_after is not None and turn.output.result_at >= answered_after:
                 return
             await asyncio.sleep(min(1.5, max(0.1, deadline - time.monotonic())))
 
@@ -657,6 +804,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 where += "; Claude Code is working"
             elif turn and not turn.delivered:
                 where += "; a reply is waiting"
+            if turn and turn.open:
+                where += "; Claude Code is open for follow-ups"
             if conversation and conversation.queue:
                 where += f"; {len(conversation.queue)} message(s) queued"
             lines.append(f"- {project.name} ({where}; {self._access_note(project, now)})")
@@ -711,12 +860,25 @@ kill -KILL -- "-$p" 2>/dev/null || true
             self.access.save()
             conversation = self._conversation(project, kind)
             await self._refresh(project, conversation)
-            if conversation.turn and conversation.turn.phase in (STARTING, RUNNING):
+            current = conversation.turn
+            if current and current.working:
                 if new_conversation:
                     raise RelayError(f"Claude Code is still working in {project.name}. A new "
                                      "conversation can start once it has finished, or after "
                                      "a stop.")
                 return await self._add_to_running(project, conversation, message, wait_seconds)
+            if not new_conversation and (conversation.queue or (
+                    current and current.phase == FINISHED and not current.ended)):
+                if current and current.open and not conversation.queue:
+                    answer = await self._continue(project, conversation, message,
+                                                  wait_seconds)
+                    if answer:
+                        return answer
+                    await self._refresh(project, conversation)
+                if conversation.queue or (current and not current.ended):
+                    return self._queue_message(project, conversation, message)
+            await self._close_before_start(project, kind, "a new conversation"
+                                           if new_conversation else "a new run started")
             turn, resume = self._begin(project, conversation, message, new_conversation)
             container_running = conversation.on_host or bool(
                 await asyncio.to_thread(targets.running_container, self.config, project))
@@ -729,8 +891,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     await asyncio.sleep(0.5)
                 remaining = int(deadline - time.monotonic())
                 if turn.phase == RUNNING and remaining > 0:
-                    await self._wait(project, conversation, remaining)
-            if turn.phase in (FINISHED, FAILED):
+                    await self._wait(project, conversation, remaining, answered_after=0)
+            if turn.phase in (FINISHED, FAILED) or self._answered(turn):
                 return self._report(project, conversation, mark_delivered=True)
 
         what = "Continuing the existing conversation" if resume else "Started a new conversation"
@@ -794,22 +956,122 @@ kill -KILL -- "-$p" 2>/dev/null || true
             conversation.session_id = str(uuid.uuid4())
         turn = Turn(str(uuid.uuid4()), message, time.time(), resumed=resume,
                     earlier_reply=earlier_reply)
-        conversation.turn = turn
-        self._save()
-        self._write_log(project, project_log.request(
-            message, where=_where(self._kind_of(project, conversation)), continued=resume,
-            earlier=earlier_reply), new_request=True)
-        self._update_keep_awake()
-        self._emit("run_started", project=project.name,
-                   kind=self._kind_of(project, conversation),
-                   full_access=self._kind_of(project, conversation) == HOST,
-                   message=message[:300])
+        self._started(project, conversation, turn, resume)
         task = asyncio.create_task(
             self._start(project, conversation, turn, conversation.session_id, resume))
         self.background.add(task)
         task.add_done_callback(self.background.discard)
-        self._follow(_key(project, self._kind_of(project, conversation)))
         return turn, resume
+
+    def _started(self, project: Project, conversation: Conversation, turn: Turn,
+                 continued: bool) -> None:
+        """Makes turn the conversation's current one, for a new run or the
+        run that is open already."""
+        conversation.turn = turn
+        self._save()
+        kind = self._kind_of(project, conversation)
+        self._write_log(project, project_log.request(
+            turn.message, where=_where(kind), continued=continued,
+            earlier=turn.earlier_reply), new_request=True)
+        self._update_keep_awake()
+        self._emit("run_started", project=project.name, kind=kind, full_access=kind == HOST,
+                   message=turn.message[:300])
+        self._follow(_key(project, kind))
+
+    async def _continue(self, project: Project, conversation: Conversation, message: str,
+                        wait_seconds: int) -> str | None:
+        """Passes message into the open run of conversation as a new request;
+        None if the run takes no messages any more."""
+        target = await asyncio.to_thread(self._target, project, conversation, start=False)
+        if target is None:
+            return None
+        mark = await asyncio.to_thread(self._pass_in, target, conversation.turn, message)
+        if mark is None:
+            self._save()
+            return None
+        turn = await self._next_turn(project, conversation, message, mark)
+        log.info("send_message %s: %d characters, passed into the open run", project.name,
+                 len(message))
+        if wait_seconds > 0:
+            await self._wait(project, conversation, wait_seconds, answered_after=mark)
+            if turn.phase in (FINISHED, FAILED) or self._answered(turn):
+                return self._report(project, conversation, mark_delivered=True)
+        where = ""
+        if conversation.on_host and project.has_devcontainer:
+            where = " on the host (not in the dev container, as approved at the laptop)"
+        return (f"Passed the message to Claude Code in {project.name}{where}, which was open "
+                "and waiting for it (the conversation continues). It is working on it. Ask "
+                "for the result later with get_updates.")
+
+    async def _next_turn(self, project: Project, conversation: Conversation, message: str,
+                         mark: int) -> Turn:
+        """The turn for a message just passed into the open run of the
+        conversation's current turn, which is done."""
+        old = conversation.turn
+        earlier = await self._unreported(project, conversation)
+        turn = Turn(str(uuid.uuid4()), message, time.time(), phase=RUNNING, resumed=True,
+                    born=True, earlier_reply=earlier, run=old.run_id, pid=old.pid,
+                    base=old.offset, offset=old.offset, mark=mark, logged=old.logged)
+        turn.output.session_id = old.output.session_id
+        self._started(project, conversation, turn, True)
+        return turn
+
+    def _queue_message(self, project: Project, conversation: Conversation,
+                       message: str) -> str:
+        """Queues message until the run of conversation can take it, or has
+        ended and a new one can be started."""
+        turn = conversation.turn
+        conversation.queue.append(message)
+        self._save()
+        self._write_log(project, project_log.queued(message))
+        self._watch(_key(project, self._kind_of(project, conversation)))
+        log.info("send_message %s: %d characters, queued", project.name, len(message))
+        if turn and turn.phase == STARTING:
+            why = ("Claude Code is still being started, so the message cannot be passed "
+                   "in yet. It is passed in as soon as Claude Code runs")
+        elif not turn or not conversation.queue[:-1]:
+            why = ("Claude Code is just ending its run and takes no more messages. The "
+                   "message is sent automatically, in the same conversation, as soon as "
+                   "that run has ended")
+        else:
+            why = "earlier messages are still waiting; it follows them"
+        count = len(conversation.queue)
+        waiting = f" {count} messages are queued now." if count > 1 else ""
+        return f"Queued the message for {project.name}: {why}.{waiting}"
+
+    async def _close_run(self, project: Project, conversation: Conversation,
+                         reason: str) -> None:
+        """Ends the run of conversation's turn gracefully: its input is
+        closed, Claude Code finishes what it still has and exits. The
+        conversation stays; the next message resumes it in a new run."""
+        turn = conversation.turn
+        if not turn or turn.ended or turn.closed or turn.phase == STARTING:
+            return
+        target = await asyncio.to_thread(self._target, project, conversation, start=False)
+        if target is None:
+            turn.ended = True       # the container is gone, and the run with it
+        else:
+            await asyncio.to_thread(self._close, target, turn)
+        turn.closed, turn.close_reason = True, reason
+        self._save()
+        log.info("%s: closing the run (%s)", _key(project, self._kind_of(project,
+                                                                          conversation)),
+                 reason)
+        if not turn.working:
+            self._write_log(project, project_log.note(
+                f"Claude Code was closed ({reason}); the next message continues the "
+                "conversation."))
+
+    async def _close_before_start(self, project: Project, kind: str,
+                                  reason: str = "a new run started") -> None:
+        """Before a new run of project as kind: closes the runs still open,
+        of the other kind (a switch) and of this one (a new conversation, or a
+        run that failed but may still be there). Never a working one."""
+        for other, conversation in self._project_conversations(project):
+            turn = conversation.turn
+            if turn and not turn.working and not turn.ended:
+                await self._close_run(project, conversation, reason if other == kind
+                                      else f"switched to run {_where(kind)}")
 
     def _follow(self, key: str) -> None:
         """Reads the output of conversation key's running request as it comes,
@@ -837,6 +1099,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 # followed any more, so it is over for the relay.
                 turn.phase = FAILED
                 turn.error = "The project's folder is gone."
+                turn.ended = True
                 self._save()
                 log.warning("%s: the project folder is gone; its request counts as ended",
                             key)
@@ -854,41 +1117,29 @@ kill -KILL -- "-$p" 2>/dev/null || true
     async def _add_to_running(self, project: Project, conversation: Conversation,
                               message: str, wait_seconds: int) -> str:
         """A message for a project where Claude Code is working: passed into the
-        run, or queued as the next request."""
+        run, or queued while it is still being started."""
         turn = conversation.turn
         # Queued messages go first, so the order stays as sent.
         if turn.phase == RUNNING and not turn.closed and not conversation.queue:
             target = await asyncio.to_thread(self._target, project, conversation, start=False)
-            if target and await asyncio.to_thread(self._pass_in, target, turn, message):
+            mark = await asyncio.to_thread(self._pass_in, target, turn, message) \
+                if target else None
+            if mark is not None:
+                turn.mark = mark
                 turn.passed_in.append(message)
                 self._save()
                 self._write_log(project, project_log.passed_in(message))
                 log.info("send_message %s: %d characters, passed into the running request",
                          project.name, len(message))
                 if wait_seconds > 0:
-                    await self._wait(project, conversation, wait_seconds)
-                    if turn.phase in (FINISHED, FAILED):
+                    await self._wait(project, conversation, wait_seconds, answered_after=mark)
+                    if turn.phase in (FINISHED, FAILED) or self._answered(turn):
                         return ("Passed the message into the running request. "
                                 + self._report(project, conversation, mark_delivered=True))
                 return (f"Passed the message directly into the request Claude Code in "
                         f"{project.name} is working on; it takes it into account at its "
                         "next step. Ask for the result later with get_updates.")
-        conversation.queue.append(message)
-        self._save()
-        self._write_log(project, project_log.queued(message))
-        self._watch(_key(project, self._kind_of(project, conversation)))
-        log.info("send_message %s: %d characters, queued", project.name, len(message))
-        if turn.phase == STARTING:
-            why = ("Claude Code is still being started, so the message cannot be passed "
-                   "in yet. It is passed into the request as soon as Claude Code runs, or "
-                   "sent as a follow-up request if that is no longer possible")
-        else:
-            why = ("the request Claude Code is working on is already ending and takes no "
-                   "more messages. It is sent automatically as a follow-up request in the "
-                   "same conversation as soon as the current one has finished")
-        count = len(conversation.queue)
-        waiting = f" {count} messages are queued now." if count > 1 else ""
-        return f"Queued the message for {project.name}: {why}.{waiting}"
+        return self._queue_message(project, conversation, message)
 
     # --- the queue ------------------------------------------------------------
 
@@ -925,13 +1176,59 @@ kill -KILL -- "-$p" 2>/dev/null || true
         if self.sweeper is None or self.sweeper.done():
             self.sweeper = asyncio.create_task(self._sweep_forever())
 
-    def _may_run(self, project: Project, conversation: Conversation, now: float) -> bool:
+    def _may_run(self, project: Project, conversation: Conversation, now: float, *,
+                 idle_ok: bool = False) -> bool:
         """Whether a grant still covers conversation's kind of project."""
-        grant = self.access.covering(project.name, natural(project), now)
+        grant = self.access.covering(project.name, natural(project), now, idle_ok=idle_ok)
         if not grant:
             return False
         kind = grant.kind if grant.target != ALL else natural(project)
         return kind == self._kind_of(project, conversation)
+
+    def _granted_kind(self, project: Project, now: float) -> str | None:
+        """The kind a grant (idle or not) lets project run as, or None. Also
+        while the control interface is away: grants do not count then, but
+        they are not gone, so that alone ends nothing."""
+        suspended, self.access.suspended = self.access.suspended, ""
+        try:
+            grant = self.access.covering(project.name, natural(project), now, idle_ok=True)
+        finally:
+            self.access.suspended = suspended
+        if not grant:
+            return None
+        return grant.kind if grant.target != ALL else natural(project)
+
+    def _covered(self, project: Project, conversation: Conversation, now: float) -> bool:
+        return self._granted_kind(project, now) == self._kind_of(project, conversation)
+
+    def _close_reason(self, project: Project, conversation: Conversation,
+                      now: float) -> str:
+        """Why the open run of conversation should end now, or "": nothing
+        was sent for conversation_idle_minutes, or no grant covers it any more
+        (also when a switch moved the grant to the other kind)."""
+        turn = conversation.turn
+        if not turn or not turn.open or conversation.queue:
+            return ""
+        granted = self._granted_kind(project, now)
+        if granted is None:
+            return "no approval covers it any more"
+        if granted != self._kind_of(project, conversation):
+            return f"switched to run {_where(granted)}"
+        switch = self.access.switches.get(project.name)
+        if switch and switch.kind != self._kind_of(project, conversation):
+            return f"switching to run {_where(switch.kind)}"
+        if now - turn.done_at >= self.conversation_idle:
+            return f"idle for {_duration(self.conversation_idle)}"
+        return ""
+
+    async def _close_due(self, project: Project) -> None:
+        """Closes the open runs of project that should end (see _close_reason).
+        The caller holds the project's lock."""
+        now = self.clock()
+        for _, conversation in self._project_conversations(project):
+            reason = self._close_reason(project, conversation, now)
+            if reason:
+                await self._close_run(project, conversation, reason)
 
     def _queue_to_request(self, project: Project, conversation: Conversation,
                           now: float) -> None:
@@ -968,25 +1265,32 @@ kill -KILL -- "-$p" 2>/dev/null || true
                     turn = conversation.turn
                     if turn and turn.phase == STARTING:
                         continue
-                    if turn and turn.phase == RUNNING:
-                        await self._refresh(project, conversation)
+                    await self._refresh(project, conversation)
                     message = "\n\n".join(conversation.queue)
-                    if turn and turn.phase == RUNNING:
+                    if turn and not turn.ended and turn.phase in (RUNNING, FINISHED):
                         if turn.closed:
-                            continue
+                            continue        # it is ending: wait until it has ended
                         target = await asyncio.to_thread(self._target, project, conversation,
                                                          start=False)
-                        if target and await asyncio.to_thread(self._pass_in, target, turn,
-                                                              message):
-                            turn.passed_in += conversation.queue
+                        mark = await asyncio.to_thread(self._pass_in, target, turn,
+                                                       message) if target else None
+                        if mark is None:
+                            continue
+                        queued, conversation.queue = conversation.queue, []
+                        if turn.phase == RUNNING:
+                            turn.mark = mark
+                            turn.passed_in += queued
                             self._write_log(project, project_log.passed_in(message))
-                            conversation.queue = []
                             self._save()
                             log.info("%s: passed the queue into the running request", key)
-                            return
-                        continue
+                        else:
+                            await self._next_turn(project, conversation, message, mark)
+                            log.info("%s: passed the queue into the open run", key)
+                        return
                     conversation.queue = []
                     earlier = await self._unreported(project, conversation) if turn else ""
+                    await self._close_before_start(project,
+                                                   self._kind_of(project, conversation))
                     self._begin(project, conversation, message, False, earlier)
                     log.info("%s: sent the queue as the next request", key)
                     return
@@ -1041,7 +1345,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             if waiting and turn.delivered and not conversation.busy:
                 return waiting
             prefix = waiting + "\n\n" if waiting else ""
-            if turn.phase == FINISHED and not turn.output_loaded:
+            if turn.phase == FINISHED and not turn.output_loaded and turn.ended:
                 if turn.delivered:
                     return prefix + (f"Claude Code in {project.name} finished the last request, "
                                      "and its reply was already reported. It is not kept here "
@@ -1086,6 +1390,15 @@ kill -KILL -- "-$p" 2>/dev/null || true
             working = [c for _, c in self._project_conversations(project)
                        if c.turn and c.turn.phase in (STARTING, RUNNING)]
             if not working:
+                await self._refresh_all(project)
+                idle = [c for _, c in self._project_conversations(project)
+                        if c.turn and c.turn.open]
+                for conversation in idle:
+                    await self._close_run(project, conversation, "stopped on request")
+                if idle:
+                    return (f"Claude Code was not working in {project.name}; it was waiting "
+                            "for the next message, and has been closed. The conversation is "
+                            "kept.")
                 return f"Claude Code is not working in {project.name}."
             conversation = working[0]
             turn = conversation.turn
@@ -1099,10 +1412,14 @@ kill -KILL -- "-$p" 2>/dev/null || true
         return f"Stopped Claude Code in {project.name}. The conversation is kept.{note}"
 
     async def _stop_conversation(self, project: Project, conversation: Conversation) -> int:
-        """Stops the running turn of conversation and drops its queue; the
-        number of messages dropped. The caller holds the project's lock."""
+        """Stops the running turn of conversation (or closes its open run)
+        and drops its queue; the number of messages dropped. The caller holds
+        the project's lock."""
         turn = conversation.turn
+        if turn and turn.phase == FINISHED and not turn.ended:
+            await self._close_run(project, conversation, "stopped on request")
         if turn and turn.phase == RUNNING:
+            ended = turn.ended
             target = await asyncio.to_thread(self._target, project, conversation, start=False)
             if target:
                 await asyncio.to_thread(self._stop, target, turn)
@@ -1112,6 +1429,13 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 turn.error = "Stopped on request."
                 self._write_log(project, project_log.ended("stopped", "Stopped on request."))
             turn.delivered = True
+            # Killed, also if the poll came too early to see it.
+            turn.closed, turn.close_reason, turn.ended = True, "stopped on request", True
+            if not ended:
+                self._emit("process_ended", project=project.name,
+                           kind=self._kind_of(project, conversation),
+                           reason="stopped on request")
+            self._update_keep_awake()
         dropped = len(conversation.queue)
         conversation.queue = []
         self._save()
@@ -1170,6 +1494,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
             if busy and busy != kind:
                 return self._switch(project, kind, params, when_idle, [], now)
             grant = self._add_grant(project, params, now)
+            await self._close_due(project)      # an open run of the other kind
             return {"grant": self._grant_info(grant, now, seconds)}
 
     def _add_grant(self, project: Project, params: dict, now: float) -> Grant:
@@ -1233,6 +1558,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 return result
             self.access.take_request(request_id, now, messages)
             grant = self._add_grant(project, params, now)
+            await self._close_due(project)      # an open run of the other kind
             self._emit("request_answered", request=request_id, project=project.name,
                        approved=True)
             self._log_note(project.name, f"Request {request.number} was approved at the "
@@ -1288,6 +1614,11 @@ kill -KILL -- "-$p" 2>/dev/null || true
                             self.access.save()
                     else:
                         self._queue_to_request(project, conversation, now)
+                        # Open and waiting: ends now. Still working: ends once
+                        # done (the sweeper, see _close_reason).
+                        if conversation.turn and conversation.turn.open \
+                                and not self._covered(project, conversation, now):
+                            await self._close_run(project, conversation, "approval ended")
         return stopped
 
     async def release_access(self, project_name: str, all_projects: bool) -> str:
@@ -1327,12 +1658,16 @@ kill -KILL -- "-$p" 2>/dev/null || true
             raise RelayError(
                 f"Not released: Claude Code is still working in {', '.join(busy)}, or has "
                 "messages waiting there. Release it once it has finished, or stop it first.")
+        ended = []
         for grant in grants:
             if grant.id in self.access.grants:
                 self.access.end(grant.id)
+                ended.append(grant)
                 self._emit("grant_ended", grant=grant.id, reason="released by the chat",
                            stopped=False)
         self.access.save()
+        for grant in ended:
+            await self._after_grant_end(grant, False)     # closes the open runs
         log.info("released %d grant(s) on request of the chat", len(grants))
         if all_projects:
             return "Released all approvals. Every project is locked again."
@@ -1366,13 +1701,13 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 log.exception("checking grants failed")
 
     async def sweep(self) -> None:
-        """Ends grants that ran out, drops expired requests, and carries out
-        switches whose other side has become idle."""
+        """Ends grants that ran out, drops expired requests, carries out
+        switches whose other side has become idle, and closes open runs that
+        should end (see _close_reason)."""
         projects = {p.name: p for p in await asyncio.to_thread(targets.list_projects,
                                                                 self.config)}
         for project in projects.values():
-            if any(c.turn and c.turn.phase == RUNNING
-                   for _, c in self._project_conversations(project)):
+            if any(self._watched(c.turn) for _, c in self._project_conversations(project)):
                 await self._check(project)
         now = self.clock()
         # A running request is use: it keeps the grants that cover it alive.
@@ -1396,6 +1731,11 @@ kill -KILL -- "-$p" 2>/dev/null || true
             project = projects.get(name)
             if project:
                 await self._advance_switch(project, switch)
+        # Open runs that waited long enough, or that no grant covers any more.
+        for project in projects.values():
+            if any(c.turn and c.turn.open for _, c in self._project_conversations(project)):
+                async with self._lock(project.name):
+                    await self._close_due(project)
         self.access.save()
         self._update_keep_awake()
 
@@ -1428,7 +1768,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
             stopped = 0
             for _, conversation in self._project_conversations(project):
                 working = conversation.turn and conversation.turn.phase == RUNNING
-                if working or conversation.queue:
+                if working or conversation.queue or (conversation.turn
+                                                     and conversation.turn.open):
                     await self._stop_conversation(project, conversation)
                     stopped += bool(working)
             switch = self.access.switches.pop(project.name, None)
@@ -1468,6 +1809,7 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 self._add_grant(project, switch.grant, now)
             self.access.save()
             self._emit("switch_done", project=project.name, kind=switch.kind)
+            await self._close_due(project)      # the other side, if still open
             if switch.held:
                 route, _, kind = self._route(project, now)
                 if route == "go" and kind == switch.kind:
@@ -1507,12 +1849,16 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 continue
             grant = self.access.covering(project.name, natural(project), now)
             busy = self._busy_kind(project)
+            open_kind = next((k for k, c in self._project_conversations(project)
+                              if c.turn and c.turn.open), None)
             projects.append({
                 "name": project.name, "dev_container": project.has_devcontainer,
                 "grant": grant.id if grant else None,
                 "kind": (grant.kind if grant.target != ALL else natural(project))
                 if grant else None,
-                "busy": busy})
+                "busy": busy,
+                # Claude Code waits there for the next message (not working).
+                "open": open_kind})
         return {
             "instance": self.config.instance_name,
             "keep_awake": self.keep_awake.state(),
@@ -1536,7 +1882,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
     @staticmethod
     def _replies(out: TurnOutput) -> str:
         if len(out.results) > 1:
-            # A message passed in after a pass had ended got a pass of its own.
+            # A message passed in after a pass had ended, or a background task
+            # that ended, got a pass of its own.
             return "Final replies, in order:\n" + "\n\n---\n\n".join(out.results)
         return f"Final reply:\n{out.result}"
 
@@ -1563,8 +1910,18 @@ kill -KILL -- "-$p" 2>/dev/null || true
         if turn.phase == RUNNING:
             text = f"\nLatest message from Claude Code:\n{out.last_text[-1200:]}" \
                 if out.last_text else ""
+            background = ""
+            if out.tasks:
+                background = (f"\n{len(out.tasks)} background task(s) still running: "
+                              + "; ".join(list(out.tasks.values())[:5]) + ".")
+            if out.results and out.result_at >= turn.mark:
+                # It answered, but works on in the background (or goes on).
+                replies = "\n\n---\n\n".join(out.results[-3:])
+                return (f"{earlier}Claude Code in {project.name} has replied, but is still "
+                        f"working ({took} so far).{background}{passed}{queue_note}"
+                        f"{step_block}\nReply so far:\n{replies}")
             return (f"{earlier}Claude Code in {project.name} is still working ({took} so far)."
-                    f"{passed}{queue_note}{step_block}{text}")
+                    f"{background}{passed}{queue_note}{step_block}{text}")
         again = "" if not turn.delivered else " (already reported once)"
         if mark_delivered and not turn.delivered:
             turn.delivered = True
@@ -1572,5 +1929,10 @@ kill -KILL -- "-$p" 2>/dev/null || true
         if turn.phase == FAILED:
             return f"{earlier}The request to {project.name} failed{again}: {turn.error}{queue_note}"
         status = "reported an error" if out.is_error else "finished"
+        open_note = ""
+        if turn.open:
+            open_note = ("\nClaude Code stays open in this conversation for follow-ups "
+                         f"(closed after {_duration(self.conversation_idle)} without a "
+                         "message).")
         return (f"{earlier}Claude Code in {project.name} {status} after {took}{again}."
-                f"{passed}{queue_note}{step_block}\n{self._replies(out)}")
+                f"{passed}{queue_note}{step_block}\n{self._replies(out)}{open_note}")

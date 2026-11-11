@@ -66,6 +66,28 @@ async def until_finished(relay, project, seconds=10):
     raise AssertionError(f"{project} never finished")
 
 
+async def close_open_run(relay, key, seconds=10):
+    """Lets the open run of conversation key time out, and waits until it
+    has ended."""
+    idle, relay.conversation_idle = relay.conversation_idle, 0
+    try:
+        await relay.sweep()
+        for _ in range(seconds * 10):
+            await relay.get_updates(key.split("/")[0], 0)
+            if relay.conversations[key].turn.ended:
+                return
+            await asyncio.sleep(0.1)
+    finally:
+        relay.conversation_idle = idle
+    raise AssertionError(f"the run of {key} never ended")
+
+
+async def end_run(relay, key):
+    """Asks the run of conversation key to end, as the relay does when it closes it."""
+    await relay._close_run(targets.find_project(relay.config, key.split("/")[0]),
+                           relay.conversations[key], "test")
+
+
 def test_list_projects_skips_hidden(setup):
     config, _ = setup
     listing = run(Relay(config).list_projects())
@@ -110,13 +132,21 @@ def test_follow_up_resumes_and_new_conversation_does_not(setup):
         relay = Relay(config)
         await relay.send_message("alpha", "one", False, 8)
         session = relay.conversations["alpha"].session_id
+        first_run = relay.conversations["alpha"].turn.run_id
+        # The run stays open: the follow-up goes into it.
         second = await relay.send_message("alpha", "two", False, 8)
-        assert "(resumed)" in second
+        assert "Done: two (new)" in second
+        assert relay.conversations["alpha"].turn.run_id == first_run
+        # Once closed, the next message resumes the conversation in a new run.
+        await close_open_run(relay, "alpha")
+        third = await relay.send_message("alpha", "three", False, 8)
+        assert "Done: three (resumed)" in third
+        assert relay.conversations["alpha"].turn.run_id != first_run
         assert relay.conversations["alpha"].session_id == session
         args = json.loads((projects / "alpha/fake-args.txt").read_text())
         assert args[args.index("--resume") + 1] == session
-        third = await relay.send_message("alpha", "three", True, 8)
-        assert "(new)" in third
+        fourth = await relay.send_message("alpha", "four", True, 8)
+        assert "(new)" in fourth
         assert relay.conversations["alpha"].session_id != session
     run(scenario())
 
@@ -170,9 +200,9 @@ def test_a_message_for_an_ending_run_follows_as_the_next_request(setup, monkeypa
         await relay.send_message("alpha", "sleep 2", False, 0)
         await until_running(relay, "alpha")
         first = relay.conversations["alpha"].turn
-        first.closed = True                 # as if it had stopped taking messages
+        await end_run(relay, "alpha")       # it takes no more messages
         answer = await relay.send_message("alpha", "one", False, 0)
-        assert "Queued the message" in answer and "follow-up request" in answer
+        assert "Queued the message" in answer and "as soon as that run has ended" in answer
         assert "2 messages are queued" in await relay.send_message("alpha", "two", False, 0)
         for _ in range(100):
             if relay.conversations["alpha"].turn is not first:
@@ -193,16 +223,16 @@ def test_a_queue_survives_a_restart(setup, monkeypatch):
         relay = Relay(config)
         await relay.send_message("alpha", "sleep 2", False, 0)
         await until_running(relay, "alpha")
-        relay.conversations["alpha"].turn.closed = True
+        await end_run(relay, "alpha")
         await relay.send_message("alpha", "after", False, 0)
         for task in list(relay.watchers.values()):
             task.cancel()                   # the server goes down
         restarted = Relay(config)
         await restarted.get_updates("alpha", 0)     # takes up the queue
-        # Passed into the run, which still takes messages, or sent after it.
+        # Sent once the run has ended, in a new one.
         for _ in range(100):
             report = await restarted.get_updates("alpha", 0)
-            if "Done: sleep 2 + after (new)" in report or "Done: after (resumed)" in report:
+            if "Done: after (resumed)" in report:
                 break
             await asyncio.sleep(0.1)
         else:

@@ -131,7 +131,7 @@ def test_approving_runs_the_waiting_messages(setup):
         report = await until_done(relay, "web")
         assert "Done: one\n\ntwo (new)" in report
         # Approved now: the next message runs directly.
-        assert "Continuing" in await relay.send_message("web", "three", False, 0)
+        assert "Passed the message" in await relay.send_message("web", "three", False, 0)
     run(scenario())
 
 

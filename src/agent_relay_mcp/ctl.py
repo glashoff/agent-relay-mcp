@@ -144,7 +144,8 @@ def show_state(state: dict) -> None:
     for p in state["projects"]:
         kind = {"host": "on the host", "container": "in the dev container"}.get(p["kind"])
         status = f"approved, {kind}" if p["grant"] else "locked"
-        busy = ", working" if p["busy"] else ""
+        busy = ", working" if p["busy"] else \
+            ", open for follow-ups" if p.get("open") else ""
         container = "" if p["dev_container"] else "  [no dev container]"
         print(f"  {p['name']}: {status}{busy}{container}")
 
