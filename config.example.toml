@@ -12,6 +12,21 @@ path = "/mcp"
 # No default; for example:
 # public_hosts = ["example.org"]
 
+# Unix sockets, for clients on this machine without a TCP path to the relay
+# (the voice service in its container). Both off (empty) by default; "~" and
+# $XDG_RUNTIME_DIR are expanded. The relay creates the directory with mode
+# 700 if it is missing, the sockets with mode 600, replaces a stale socket
+# file and removes the sockets when it stops.
+# mcp_socket: the same MCP endpoint as above (same Host and Origin checks:
+# clients send "Host: localhost:8765"), in addition to the TCP port.
+# events_socket: every control event (run started or ended, request added,
+# ...) as one JSON object per line, the same JSON as the D-Bus signal Event.
+# Read-only: nothing sent to it is read. Recommended values:
+# mcp_socket = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"
+# events_socket = "$XDG_RUNTIME_DIR/agent-relay/events.sock"
+mcp_socket = ""
+events_socket = ""
+
 # Every direct subdirectory of this folder is a project.
 projects_dir = "~/Projects"
 

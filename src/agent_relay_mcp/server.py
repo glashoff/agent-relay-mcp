@@ -2,17 +2,21 @@
 
 
 import argparse
+import asyncio
 import contextlib
 import logging
+import signal
 from pathlib import Path
 from typing import Annotated
 
+import uvicorn
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 
 from . import config as config_module
+from . import sockets
 from .control import Control
 from .relay import Relay
 from .targets import RelayError
@@ -69,6 +73,11 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         # Until a control interface runs, nothing could revoke a grant, so
         # none counts (fail closed); the interface lifts this when it is up.
         relay.set_control(False, "the control interface is starting")
+        events = None
+        if config.events_socket:
+            # Read-only: the events of the control layer, no commands.
+            events = sockets.EventsSocket(Path(config.events_socket), Control(relay).events)
+            await events.start()
         bus = await start_dbus(config, relay)
         if bus is None:
             logging.getLogger("agent_relay_mcp").error(
@@ -80,6 +89,8 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         finally:
             if bus:
                 bus.stop()
+            if events:
+                await events.stop()
             relay.close()
 
     server = MCPServer("agent-relay-mcp", instructions=instructions, version="0.1.0",
@@ -192,6 +203,18 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
     server, _ = build(config)
+    app = http_app(server, config)
+    logging.getLogger("agent_relay_mcp").info(
+        "listening on %s:%d%s, projects in %s", config.listen_host, config.listen_port,
+        config.path, config.projects_dir)
+    try:
+        asyncio.run(serve(app, config, log_level=server.settings.log_level.lower()))
+    except sockets.SocketError as error:
+        raise SystemExit(f"agent-relay-mcp: {error}") from None
+
+
+def http_app(server: MCPServer, config: config_module.Config):
+    """The MCP endpoint as one ASGI app, for every listener."""
     hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
     for host in config.public_hosts:
         hosts += [host, f"{host}:*"]
@@ -199,13 +222,80 @@ def main() -> None:
         enable_dns_rebinding_protection=True, allowed_hosts=hosts,
         allowed_origins=[f"https://{h}" for h in config.public_hosts]
         + ["http://127.0.0.1:*", "http://localhost:*"])
-    logging.getLogger("agent_relay_mcp").info(
-        "listening on %s:%d%s, projects in %s", config.listen_host, config.listen_port,
-        config.path, config.projects_dir)
-    server.run("streamable-http", host=config.listen_host, port=config.listen_port,
-               streamable_http_path=config.path, json_response=True, stateless_http=True,
-               transport_security=security)
+    return server.streamable_http_app(
+        streamable_http_path=config.path, json_response=True, stateless_http=True,
+        transport_security=security, host=config.listen_host)
 
+
+class _Server(uvicorn.Server):
+    """A uvicorn server that leaves signals to serve(): with two servers, each
+    would take the handlers from the other, and uvicorn raises the signal
+    again when it is done, which would end the process before the app's
+    lifespan has shut down."""
+
+    def capture_signals(self):
+        return contextlib.nullcontext()
+
+
+async def serve(app, config: config_module.Config, *, log_level: str = "info",
+                stop: asyncio.Event | None = None, signals: bool = True) -> None:
+    """Serves app on the TCP port and, if configured, on mcp_socket: two
+    uvicorn servers on one app. The app's lifespan (the MCP session manager
+    and with it the relay's) can run only once, so it runs here, around both,
+    and the servers run without one. Ends on SIGINT/SIGTERM or when stop is set."""
+    log = logging.getLogger("agent_relay_mcp")
+    unix_path = Path(config.mcp_socket) if config.mcp_socket else None
+    unix_sock = sockets.bind(unix_path) if unix_path else None   # before anything starts
+    unix_inode = sockets.inode(unix_path) if unix_sock else 0
+    listeners: list[tuple[uvicorn.Server, list | None]] = [(_Server(uvicorn.Config(
+        app, host=config.listen_host, port=config.listen_port, lifespan="off",
+        log_level=log_level)), None)]
+    if unix_sock:
+        listeners.append((_Server(uvicorn.Config(app, lifespan="off", log_level=log_level)),
+                          [unix_sock]))
+    servers = [server for server, _ in listeners]
+    failed = False
+
+    def shut_down(force: bool = False) -> None:
+        for server in servers:
+            if force and server.should_exit:
+                server.force_exit = True
+            server.should_exit = True
+
+    async def run(server: uvicorn.Server, socks) -> None:
+        nonlocal failed
+        try:
+            await server.serve(sockets=socks)
+        except SystemExit:          # uvicorn could not start it (e.g. port in use)
+            failed = True
+        finally:
+            shut_down()             # one ends: all end
+
+    async def wait_for_stop() -> None:
+        await stop.wait()
+        shut_down()
+
+    loop = asyncio.get_running_loop()
+    if signals:
+        loop.add_signal_handler(signal.SIGTERM, shut_down)
+        loop.add_signal_handler(signal.SIGINT, shut_down, True)
+    waiter = asyncio.ensure_future(wait_for_stop()) if stop else None
+    try:
+        async with app.router.lifespan_context(app):
+            if unix_path:
+                log.info("MCP endpoint also on %s", unix_path)
+            await asyncio.gather(*(run(server, socks) for server, socks in listeners))
+    finally:
+        if waiter:
+            waiter.cancel()
+        if signals:
+            loop.remove_signal_handler(signal.SIGTERM)
+            loop.remove_signal_handler(signal.SIGINT)
+        if unix_sock:
+            unix_sock.close()
+            sockets.unlink(unix_path, unix_inode)
+    if failed:
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

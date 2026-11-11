@@ -91,6 +91,15 @@ class Config:
     # for Claude Code's default (no thinking text with -p).
     thinking_display: str = "summarized"
 
+    # The MCP endpoint additionally on a Unix socket (the same app and checks
+    # as the TCP listener), and the control events as JSON lines on another,
+    # read-only, for clients on this machine without a TCP path to the relay
+    # (the voice service). Empty: off. "~" and $XDG_RUNTIME_DIR (any
+    # environment variable) are expanded, e.g.
+    # "$XDG_RUNTIME_DIR/agent-relay/mcp.sock" and ".../events.sock".
+    mcp_socket: str = ""
+    events_socket: str = ""
+
 
 def load(path: Path | None = None) -> Config:
     path = path or DEFAULT_CONFIG_FILE
@@ -122,8 +131,25 @@ def load(path: Path | None = None) -> Config:
     if config.thinking_display not in ("", "summarized", "omitted", "highlights"):
         raise SystemExit(f"{path}: thinking_display must be summarized, omitted, "
                          "highlights or empty")
+    for key in ("mcp_socket", "events_socket"):
+        setattr(config, key, expand_socket_path(getattr(config, key), f"{path}: {key}"))
+    if config.mcp_socket and config.mcp_socket == config.events_socket:
+        raise SystemExit(f"{path}: mcp_socket and events_socket must differ")
     for key in ("grant_idle_minutes", "request_expiry_minutes", "max_grant_hours",
                 "max_all_grant_hours", "max_host_grant_hours"):
         if getattr(config, key) < 1:
             raise SystemExit(f"{path}: {key} must be at least 1")
     return config
+
+
+def expand_socket_path(value: str, what: str = "socket path") -> str:
+    """value with "~" and environment variables expanded; it must then be an
+    absolute path. Empty stays empty (off)."""
+    if not value:
+        return ""
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    if "$" in expanded:
+        raise SystemExit(f"{what}: {value!r} uses an environment variable that is not set")
+    if not os.path.isabs(expanded):
+        raise SystemExit(f"{what}: {value!r} must be an absolute path")
+    return expanded
