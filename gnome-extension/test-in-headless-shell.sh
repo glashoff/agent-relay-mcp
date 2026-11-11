@@ -38,7 +38,8 @@ export default class TestHelper extends Extension {
 }
 EOF
 cat > "$OUT/config.toml" <<EOF
-listen_port = 18799
+mcp_socket = "$OUT/runtime/agent-relay/mcp.sock"
+events_socket = ""
 projects_dir = "$OUT/projects"
 state_dir = "$OUT/state"
 allow_host_projects = true
@@ -58,7 +59,8 @@ shot() {
         --method org.gnome.Shell.Screenshot.Screenshot false false "$OUT/$1.png" > /dev/null
 }
 mcp() {
-    curl -s -X POST http://127.0.0.1:18799/mcp -H 'content-type: application/json' \
+    curl -s --unix-socket "$OUT/runtime/agent-relay/mcp.sock" -X POST http://localhost/mcp \
+        -H 'content-type: application/json' \
         -H 'accept: application/json, text/event-stream' -d "$1" > /dev/null
 }
 gsettings set org.gnome.shell disable-user-extensions false

@@ -1,31 +1,23 @@
 # agent-relay-mcp configuration. Copy to ~/.config/agent-relay-mcp/config.toml.
 # Every key is optional; the values below are the defaults unless noted.
 
-# The endpoint. Keep it on loopback: the internet reaches it only through a
-# TLS reverse proxy that forwards a secret path (see README "Exposing it").
-listen_host = "127.0.0.1"
-listen_port = 8765
-path = "/mcp"
-
-# Public host name(s) the reverse proxy forwards with. Requests with any other
-# Host header are refused (421), as a guard against DNS rebinding.
-# No default; for example:
-# public_hosts = ["example.org"]
-
-# Unix sockets, for clients on this machine without a TCP path to the relay
-# (the voice service in its container). Both off (empty) by default; "~" and
-# $XDG_RUNTIME_DIR are expanded. The relay creates the directory with mode
-# 700 if it is missing, the sockets with mode 600, replaces a stale socket
-# file and removes the sockets when it stops.
-# mcp_socket: the same MCP endpoint as above (same Host and Origin checks:
-# clients send "Host: localhost:8765"), in addition to the TCP port.
+# The relay is reached only through Unix sockets on this machine; it has no
+# TCP port. "~" and environment variables such as $XDG_RUNTIME_DIR are
+# expanded. The relay creates the directory with mode 700 if it is missing,
+# the sockets with mode 600, replaces a stale socket file and removes the
+# sockets when it stops.
+# mcp_socket: the MCP endpoint (Streamable HTTP at `path`); required. Clients
+# send a local Host header ("localhost", "127.0.0.1", optionally with a port,
+# e.g. "localhost:8765" from the voice container's forwarder); any other Host
+# or a foreign Origin is refused.
 # events_socket: every control event (run started or ended, request added,
 # ...) as one JSON object per line, the same JSON as the D-Bus signal Event.
-# Read-only: nothing sent to it is read. Recommended values:
-# mcp_socket = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"
-# events_socket = "$XDG_RUNTIME_DIR/agent-relay/events.sock"
-mcp_socket = ""
-events_socket = ""
+# Read-only: nothing sent to it is read. Empty: off.
+mcp_socket = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"
+events_socket = "$XDG_RUNTIME_DIR/agent-relay/events.sock"
+path = "/mcp"
+# listen_host, listen_port and public_hosts (the TCP listener of earlier
+# versions) are obsolete: still accepted, with a warning, and ignored.
 
 # Every direct subdirectory of this folder is a project.
 projects_dir = "~/Projects"

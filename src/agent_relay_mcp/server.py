@@ -1,4 +1,4 @@
-"""The MCP endpoint: five tools over Streamable HTTP."""
+"""The MCP endpoint: five tools over Streamable HTTP, on a Unix socket only."""
 
 
 import argparse
@@ -22,11 +22,12 @@ from .relay import Relay
 from .targets import RelayError
 
 INSTRUCTIONS = """\
-This connector relays requests to Claude Code, a coding agent running on the
-user's own computer, one conversation per project (a folder there, usually with
-its own dev container). Claude Code can read and change the project's files and
-run commands in it; it works on its own and takes from a few seconds to many
-minutes per request.
+This server relays requests to Claude Code, a coding agent on this computer,
+one conversation per project (a folder here, usually with its own dev
+container). Claude Code can read and change the project's files and run
+commands in it; it works on its own and takes from a few seconds to many
+minutes per request. You reach this server only from this computer, on its
+Unix socket; you are typically the voice assistant the user talks to.
 
 How to use it:
 - When the user names a project vaguely, call list_projects and pick the
@@ -43,18 +44,19 @@ How to use it:
 - Claude Code may answer and go on working in the background (a subagent, a
   long command). get_updates then shows its reply so far and that it is still
   working; the request is finished once the background work is done too.
-  Do not call get_updates on your own in a loop; call it when the user asks
-  how it is going, or when they come back to the topic.
-- Report results the way the user needs them. In a voice conversation, give a
-  short spoken summary in plain words without file paths, code or markup, and
-  offer details. Quote Claude Code's reply verbatim only when asked.
+- Do not call get_updates on your own in a loop; call it when the user asks
+  how it is going, when they come back to the topic, or when you are told
+  that a request has finished.
+- Report results the way the user needs them. When speaking, give a short
+  summary in plain words without file paths, code or markup, and offer
+  details. Quote Claude Code's reply verbatim only when asked.
 - Questions Claude Code asks in its reply go to the user; pass the user's
   answer back with send_message.
-- Projects are locked unless the user has approved them at their laptop. A
-  message to a locked project waits for that approval and runs by itself
-  afterwards; the reply gives a number. Tell the user the number, so they can
-  match it at the laptop. Approvals cannot be given through this connector;
-  never try to work around a locked project.
+- Projects are locked unless the user has approved them at the laptop (the
+  GNOME menu or agent-relay-ctl). A message to a locked project waits for that
+  approval and runs by itself afterwards; the reply gives a number. Tell the
+  user the number, so they can match it there. Approvals cannot be given
+  through this server; never try to work around a locked project.
 - To run a project with a dev container directly on the computer instead, pass
   run_on_host=true to send_message, but only when the user asks for exactly that.
   It only asks: the user confirms it at the laptop, with a full-access warning.
@@ -70,7 +72,7 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
     relay = Relay(config)
     instructions = INSTRUCTIONS
     if config.instance_name:
-        instructions += (f"\nThis connector works on the user's {config.instance_name}; its "
+        instructions += (f"\nThis server works on the user's {config.instance_name}; its "
                          "projects are the ones there.\n")
 
     @contextlib.asynccontextmanager
@@ -81,7 +83,9 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
         events = None
         if config.events_socket:
             # Read-only: the events of the control layer, no commands.
-            events = sockets.EventsSocket(Path(config.events_socket), Control(relay).events)
+            events = sockets.EventsSocket(
+                Path(config_module.expand_socket_path(config.events_socket)),
+                Control(relay).events)
             await events.start()
         bus = await start_dbus(config, relay)
         if bus is None:
@@ -206,14 +210,12 @@ def main() -> None:
     parser.add_argument("--config", type=Path, help=f"config file "
                         f"(default: {config_module.DEFAULT_CONFIG_FILE})")
     args = parser.parse_args()
-    config = config_module.load(args.config)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    config = config_module.load(args.config)
 
     server, _ = build(config)
     app = http_app(server, config)
-    logging.getLogger("agent_relay_mcp").info(
-        "listening on %s:%d%s, projects in %s", config.listen_host, config.listen_port,
-        config.path, config.projects_dir)
+    logging.getLogger("agent_relay_mcp").info("projects in %s", config.projects_dir)
     try:
         asyncio.run(serve(app, config, log_level=server.settings.log_level.lower()))
     except sockets.SocketError as error:
@@ -221,24 +223,23 @@ def main() -> None:
 
 
 def http_app(server: MCPServer, config: config_module.Config):
-    """The MCP endpoint as one ASGI app, for every listener."""
-    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
-    for host in config.public_hosts:
-        hosts += [host, f"{host}:*"]
+    """The MCP endpoint as an ASGI app. It is served only on the Unix socket,
+    but still checks Host and Origin as on loopback: clients send a local
+    Host (the voice container's forwarder sends "localhost:8765"), and a web
+    page cannot get a request through with its own."""
+    hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*", "127.0.0.1", "localhost", "[::1]"]
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True, allowed_hosts=hosts,
-        allowed_origins=[f"https://{h}" for h in config.public_hosts]
-        + ["http://127.0.0.1:*", "http://localhost:*"])
+        allowed_origins=["http://127.0.0.1:*", "http://localhost:*"])
     return server.streamable_http_app(
         streamable_http_path=config.path, json_response=True, stateless_http=True,
-        transport_security=security, host=config.listen_host)
+        transport_security=security)
 
 
 class _Server(uvicorn.Server):
-    """A uvicorn server that leaves signals to serve(): with two servers, each
-    would take the handlers from the other, and uvicorn raises the signal
-    again when it is done, which would end the process before the app's
-    lifespan has shut down."""
+    """A uvicorn server that leaves signals to serve(): uvicorn raises the
+    signal again when it is done, which would end the process before the
+    app's lifespan has shut down."""
 
     def capture_signals(self):
         return contextlib.nullcontext()
@@ -246,37 +247,24 @@ class _Server(uvicorn.Server):
 
 async def serve(app, config: config_module.Config, *, log_level: str = "info",
                 stop: asyncio.Event | None = None, signals: bool = True) -> None:
-    """Serves app on the TCP port and, if configured, on mcp_socket: two
-    uvicorn servers on one app. The app's lifespan (the MCP session manager
-    and with it the relay's) can run only once, so it runs here, around both,
-    and the servers run without one. Ends on SIGINT/SIGTERM or when stop is set."""
+    """Serves app on mcp_socket, the only way in: there is no TCP listener.
+    The app's lifespan (the MCP session manager and with it the relay's) runs
+    here, around the server, which runs without one. Ends on SIGINT/SIGTERM
+    or when stop is set."""
     log = logging.getLogger("agent_relay_mcp")
-    unix_path = Path(config.mcp_socket) if config.mcp_socket else None
-    unix_sock = sockets.bind(unix_path) if unix_path else None   # before anything starts
-    unix_inode = sockets.inode(unix_path) if unix_sock else 0
-    listeners: list[tuple[uvicorn.Server, list | None]] = [(_Server(uvicorn.Config(
-        app, host=config.listen_host, port=config.listen_port, lifespan="off",
-        log_level=log_level)), None)]
-    if unix_sock:
-        listeners.append((_Server(uvicorn.Config(app, lifespan="off", log_level=log_level)),
-                          [unix_sock]))
-    servers = [server for server, _ in listeners]
+    if not config.mcp_socket:
+        raise sockets.SocketError("mcp_socket is not set; it is the only way to reach "
+                                  "the relay")
+    unix_path = Path(config_module.expand_socket_path(config.mcp_socket))
+    unix_sock = sockets.bind(unix_path)     # before anything starts
+    unix_inode = sockets.inode(unix_path)
+    server = _Server(uvicorn.Config(app, lifespan="off", log_level=log_level))
     failed = False
 
     def shut_down(force: bool = False) -> None:
-        for server in servers:
-            if force and server.should_exit:
-                server.force_exit = True
-            server.should_exit = True
-
-    async def run(server: uvicorn.Server, socks) -> None:
-        nonlocal failed
-        try:
-            await server.serve(sockets=socks)
-        except SystemExit:          # uvicorn could not start it (e.g. port in use)
-            failed = True
-        finally:
-            shut_down()             # one ends: all end
+        if force and server.should_exit:
+            server.force_exit = True
+        server.should_exit = True
 
     async def wait_for_stop() -> None:
         await stop.wait()
@@ -289,20 +277,22 @@ async def serve(app, config: config_module.Config, *, log_level: str = "info",
     waiter = asyncio.ensure_future(wait_for_stop()) if stop else None
     try:
         async with app.router.lifespan_context(app):
-            if unix_path:
-                log.info("MCP endpoint also on %s", unix_path)
-            await asyncio.gather(*(run(server, socks) for server, socks in listeners))
+            log.info("MCP endpoint on %s (path %s); no TCP listener", unix_path, config.path)
+            try:
+                await server.serve(sockets=[unix_sock])
+            except SystemExit:          # uvicorn could not start it
+                failed = True
     finally:
         if waiter:
             waiter.cancel()
         if signals:
             loop.remove_signal_handler(signal.SIGTERM)
             loop.remove_signal_handler(signal.SIGINT)
-        if unix_sock:
-            unix_sock.close()
-            sockets.unlink(unix_path, unix_inode)
+        unix_sock.close()
+        sockets.unlink(unix_path, unix_inode)
     if failed:
         raise SystemExit(1)
+
 
 if __name__ == "__main__":
     main()

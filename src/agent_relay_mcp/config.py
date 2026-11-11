@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -12,11 +13,17 @@ DEFAULT_CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".
 DEFAULT_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") \
     / "agent-relay-mcp"
 
+DEFAULT_MCP_SOCKET = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"
+DEFAULT_EVENTS_SOCKET = "$XDG_RUNTIME_DIR/agent-relay/events.sock"
+# Keys of earlier versions, ignored with a warning: the relay served MCP on a
+# TCP port, for a reverse proxy, until 2026-11-11.
+OBSOLETE = {"listen_host", "listen_port", "public_hosts"}
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are not talking to the user directly. Another assistant relays the user's "
     "requests to you and reads your final reply, often to summarize it for the user "
-    "by voice while they are away from the computer. Nobody watches your intermediate "
-    "steps and nobody can answer questions while you work, so work autonomously. "
+    "by voice. Nobody watches your intermediate steps and nobody can answer "
+    "questions while you work, so work autonomously. "
     "End every task with a short, plain final message: what you did, what you found, "
     "and anything the user has to decide. Avoid long code listings in that message."
 )
@@ -24,14 +31,9 @@ DEFAULT_SYSTEM_PROMPT = (
 
 @dataclass
 class Config:
-    # Where the MCP endpoint listens. Keep it on loopback and put a TLS reverse
-    # proxy (or a tunnel to one) in front of it.
-    listen_host: str = "127.0.0.1"
-    listen_port: int = 8765
+    # The MCP endpoint is served only on a Unix socket (mcp_socket, below);
+    # this is its HTTP path there.
     path: str = "/mcp"
-    # Host header values the endpoint accepts besides localhost: the public
-    # host name the reverse proxy forwards, e.g. "example.org".
-    public_hosts: list[str] = field(default_factory=list)
 
     # Every direct subdirectory is a project.
     projects_dir: Path = Path("~/Projects").expanduser()
@@ -97,14 +99,12 @@ class Config:
     # for Claude Code's default (no thinking text with -p).
     thinking_display: str = "summarized"
 
-    # The MCP endpoint additionally on a Unix socket (the same app and checks
-    # as the TCP listener), and the control events as JSON lines on another,
-    # read-only, for clients on this machine without a TCP path to the relay
-    # (the voice service). Empty: off. "~" and $XDG_RUNTIME_DIR (any
-    # environment variable) are expanded, e.g.
-    # "$XDG_RUNTIME_DIR/agent-relay/mcp.sock" and ".../events.sock".
-    mcp_socket: str = ""
-    events_socket: str = ""
+    # The MCP endpoint, on a Unix socket: the only way to reach the relay
+    # (there is no TCP listener). The control events as JSON lines on
+    # another, read-only (empty: off). "~" and environment variables are
+    # expanded when the configuration is loaded.
+    mcp_socket: str = DEFAULT_MCP_SOCKET
+    events_socket: str = DEFAULT_EVENTS_SOCKET
 
 
 def load(path: Path | None = None) -> Config:
@@ -112,6 +112,12 @@ def load(path: Path | None = None) -> Config:
     raw = tomllib.loads(path.read_text()) if path.is_file() else {}
     config = Config()
     known = set(Config.__dataclass_fields__)
+    obsolete = set(raw) & OBSOLETE
+    if obsolete:
+        logging.getLogger("agent_relay_mcp").warning(
+            "%s: ignoring %s: the relay has no TCP listener any more, only mcp_socket",
+            path, ", ".join(sorted(obsolete)))
+        raw = {k: v for k, v in raw.items() if k not in OBSOLETE}
     unknown = set(raw) - known
     if unknown:
         raise SystemExit(f"{path}: unknown keys: {', '.join(sorted(unknown))}")
@@ -137,9 +143,12 @@ def load(path: Path | None = None) -> Config:
     if config.thinking_display not in ("", "summarized", "omitted", "highlights"):
         raise SystemExit(f"{path}: thinking_display must be summarized, omitted, "
                          "highlights or empty")
+    if not config.mcp_socket:
+        raise SystemExit(f"{path}: mcp_socket must be set: it is the only way to reach "
+                         "the relay")
     for key in ("mcp_socket", "events_socket"):
         setattr(config, key, expand_socket_path(getattr(config, key), f"{path}: {key}"))
-    if config.mcp_socket and config.mcp_socket == config.events_socket:
+    if config.mcp_socket == config.events_socket:
         raise SystemExit(f"{path}: mcp_socket and events_socket must differ")
     for key in ("grant_idle_minutes", "request_expiry_minutes", "max_grant_hours",
                 "max_all_grant_hours", "max_host_grant_hours"):

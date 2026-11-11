@@ -156,7 +156,7 @@ if [ -f "$CONFIG" ]; then
 else
     run mkdir -p "$CONFIG_DIR"
     run cp "$SRC/config.example.toml" "$CONFIG"
-    note "Created $CONFIG from the example: set public_hosts there."
+    note "Created $CONFIG from the example; check projects_dir there."
     CHANGED+=("configuration created")
 fi
 if [ "$DRY" = 0 ] || [ -f "$CONFIG" ]; then

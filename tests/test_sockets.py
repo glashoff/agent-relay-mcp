@@ -1,4 +1,5 @@
-"""The relay on Unix sockets: the MCP endpoint and the event stream."""
+"""The relay on Unix sockets, its only way in: the MCP endpoint and the event
+stream."""
 
 import asyncio
 import json
@@ -41,7 +42,7 @@ def config(tmp_path, run_dir, monkeypatch):
     # Never the real session bus: the relay's control interface stays off.
     return Config(projects_dir=tmp_path / "projects", allow_host_projects=True,
                   claude_command=f"{sys.executable} {FAKE}", state_dir=tmp_path / "state",
-                  keep_awake_command="", control_dbus=False, listen_port=0,
+                  keep_awake_command="", control_dbus=False,
                   mcp_socket=str(run_dir / "agent-relay/mcp.sock"),
                   events_socket=str(run_dir / "agent-relay/events.sock"))
 
@@ -75,9 +76,34 @@ def test_socket_paths_expand_the_runtime_dir_and_home(monkeypatch, tmp_path):
     assert config.events_socket == f"{tmp_path}/run/events.sock"
 
 
-def test_sockets_are_off_by_default(tmp_path):
+def test_both_sockets_are_on_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1234")
     config = load(tmp_path / "missing.toml")
-    assert config.mcp_socket == "" and config.events_socket == ""
+    assert config.mcp_socket == "/run/user/1234/agent-relay/mcp.sock"
+    assert config.events_socket == "/run/user/1234/agent-relay/events.sock"
+
+
+def test_the_mcp_socket_is_required_and_the_events_socket_optional(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1234")
+    path = tmp_path / "config.toml"
+    path.write_text('mcp_socket = ""\n')
+    with pytest.raises(SystemExit, match="only way to reach"):
+        load(path)
+    path.write_text('events_socket = ""\n')
+    assert load(path).events_socket == ""
+
+
+def test_the_keys_of_the_tcp_listener_are_ignored_with_a_warning(monkeypatch, tmp_path,
+                                                                 caplog):
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1234")
+    path = tmp_path / "config.toml"
+    path.write_text('listen_host = "127.0.0.1"\nlisten_port = 8765\n'
+                    'public_hosts = ["example.org"]\n'
+                    'mcp_socket = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"\n')
+    config = load(path)
+    assert config.mcp_socket == "/run/user/1234/agent-relay/mcp.sock"
+    assert "ignoring listen_host, listen_port, public_hosts" in caplog.text
+    assert not hasattr(config, "public_hosts")
 
 
 def test_a_socket_path_needs_its_variables_and_must_be_absolute(monkeypatch):
@@ -225,7 +251,7 @@ def test_a_client_that_does_not_keep_up_is_dropped_without_blocking(config):
     asyncio.run(scenario())
 
 
-# --- MCP and events on sockets, served next to TCP ----------------------------------------
+# --- MCP and events on sockets, the only listeners ----------------------------------------
 
 def test_mcp_over_the_unix_socket_with_events_on_the_other(config):
     server, relay = build(config)
@@ -253,7 +279,7 @@ def test_mcp_over_the_unix_socket_with_events_on_the_other(config):
                     result = await session.call_tool("send_message", {
                         "project": "web", "message": "hello"})
                     assert "waits for approval" in result.content[0].text
-            # The same Host and Origin checks as on TCP.
+            # Host and Origin are checked as on loopback.
             body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
             headers = {"Accept": "application/json, text/event-stream"}
             response = await http.post("http://evil.example/mcp", json=body, headers=headers)
@@ -261,6 +287,9 @@ def test_mcp_over_the_unix_socket_with_events_on_the_other(config):
             response = await http.post(url, json=body, headers={
                 **headers, "Origin": "https://evil.example"})
             assert response.status_code in (400, 403)
+            for host in ("localhost", "127.0.0.1"):           # without a port too
+                response = await http.post(f"http://{host}/mcp", json=body, headers=headers)
+                assert response.status_code == 200
         event = await read_event(events)
         while event["type"] == "control":
             event = await read_event(events)
