@@ -19,6 +19,7 @@ from agent_relay_mcp import ctl  # noqa: E402
 from agent_relay_mcp import relay as relay_module  # noqa: E402
 from agent_relay_mcp.config import Config  # noqa: E402
 from agent_relay_mcp.control import Control  # noqa: E402
+from agent_relay_mcp.host_actions import Action  # noqa: E402
 from agent_relay_mcp.dbus_control import (INTERFACE, NAME, NOT_ALLOWED, PATH, Caller,  # noqa: E402
                                           DBusControl, may_grant, process)
 from agent_relay_mcp.relay import Relay  # noqa: E402
@@ -323,3 +324,42 @@ def test_the_relay_is_locked_until_the_control_interface_runs(config):
     run(Control(relay).grant("web"))
     relay.set_control(False, "the control interface is starting")
     assert "locked" in run(relay.send_message("web", "hi", False, 0))
+
+
+def test_host_actions_are_shown_and_denied_by_anyone(config, capsys):
+    config.actions = {
+        "deploy": Action("deploy", "Deploy from the host",
+                         ("/usr/local/bin/deploy", "--pause", "{project}"), ("web",)),
+        "install": Action("install", "", ("{project}/install.sh",), ("alpha",),
+                          writable_by_host_runs=True)}
+
+    async def scenario():
+        # Denying only makes things safer: no trusted caller needed.
+        relay, bus = await service(config, check=lambda caller: False)
+        await relay.request_host_action("web", "deploy", "the fix is merged")
+        await relay.request_host_action("alpha", "install")
+        state = json.loads((await call("GetState")).body[0])
+        assert {a["action"] for a in state["host_actions"]} == {"deploy", "install"}
+        await ctl_run(["actions"])
+        out = capsys.readouterr().out
+        web = config.projects_dir.resolve() / "web"
+        assert f"runs: /usr/local/bin/deploy --pause {web}" in out
+        assert "note from Claude > the fix is merged" in out
+        assert "WARNING: This command lives in the project" in out
+        await ctl_run([])
+        assert "Host actions waiting:" in capsys.readouterr().out
+        deploy = relay.host_actions.waiting_for("web")
+        await ctl_run(["deny-action", str(deploy.number)])
+        assert "nothing was run" in capsys.readouterr().out
+        assert deploy.status == "denied"
+        install = relay.host_actions.waiting_for("alpha")
+        reply = await call("DenyAction", "s", [install.id])
+        assert reply.message_type == MessageType.METHOD_RETURN, reply.body
+        assert install.status == "denied"
+        reply = await call("DenyAction", "s", [install.id])
+        assert reply.message_type == MessageType.ERROR
+        assert "no waiting host action" in reply.body[0]
+        with pytest.raises(ctl.Failure, match="No waiting host action"):
+            await ctl_run(["deny-action", "47"])
+        bus.stop()
+    run(scenario())

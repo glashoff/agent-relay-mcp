@@ -275,7 +275,7 @@ def test_mcp_over_the_unix_socket_with_events_on_the_other(config):
                     await session.initialize()
                     tools = {tool.name for tool in (await session.list_tools()).tools}
                     assert tools == {"list_projects", "send_message", "get_updates", "stop",
-                                     "release_access"}
+                                     "release_access", "request_host_action", "get_host_action"}
                     result = await session.call_tool("send_message", {
                         "project": "web", "message": "hello"})
                     assert "waits for approval" in result.content[0].text

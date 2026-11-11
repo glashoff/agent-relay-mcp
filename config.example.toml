@@ -92,3 +92,35 @@ project_log = true
 # Thinking as short summaries (in the log), "omitted", or "" for Claude Code's
 # default (no thinking text in this mode).
 thinking_display = "summarized"
+
+# Host actions: fixed commands Claude may ask to have run on this computer
+# itself, outside any dev container (see docs/host-actions-plan.md). Claude
+# can only ask, with request_host_action; every single run waits for your
+# answer at the laptop. So far requests can only be denied: nothing is run
+# yet. None by default; changes take effect when the relay restarts.
+#
+# Per action ([actions.<name>], letters, digits and hyphens): a description,
+# the projects it is for (a list, or "*" for all), and the command with fixed
+# arguments: Claude cannot add any. "{project}" becomes the project's absolute
+# path; the program is an absolute path, or starts with ~/ or {project}/.
+# requires_protected: files (relative to the project) that must be mounted
+# read-only in its dev container. writable_by_host_runs = true allows a
+# command that runs of the project can change; only for listed projects
+# without a dev container, and shown with a warning.
+#
+# [actions.deploy]
+# description = "Deploy from the host"
+# command = ["~/.local/bin/devcontainer-deploy", "--pause", "{project}"]
+# projects = ["fkirchhoff.com", "server"]
+# requires_protected = ["deploy.py"]
+#
+# [actions.approve]
+# description = "Apply the container's proposals for protected files"
+# command = ["~/.local/bin/devcontainer-approve", "{project}"]
+# projects = "*"
+#
+# [actions.install]
+# description = "Install or update the relay"
+# command = ["{project}/scripts/install.sh"]
+# projects = ["agent-relay-mcp"]
+# writable_by_host_runs = true   # deliberate exception, shown with a warning

@@ -20,7 +20,7 @@ voice service (container) ── socat ──> $XDG_RUNTIME_DIR/agent-relay/mcp.
 
 ## What the client gets
 
-Five tools:
+Seven tools:
 
 | Tool | What it does |
 |---|---|
@@ -29,6 +29,8 @@ Five tools:
 | `get_updates(project, wait_seconds=0)` | The state of the latest request: still working (with its recent steps, and the reply so far if Claude Code answered and works on in the background), or the final reply |
 | `stop(project)` | Ends the current request (or Claude Code waiting for the next message); the conversation is kept |
 | `release_access(project="", all_projects=false)` | Ends your approval for a project (or all) when you say you are done, so it is locked again; refused while Claude Code still works there. It can only take access away |
+| `request_host_action(project, action, note="")` | Asks to run one of the host actions you set up for the project (below) on the computer itself; it only asks, and the reply gives a number |
+| `get_host_action(number)` | The state of a host action: waiting, denied or expired |
 
 Requests to a coding agent take minutes, but an assistant should not hang on
 a tool call that long. So nothing here waits by default: the assistant says
@@ -53,6 +55,8 @@ agent-relay-ctl deny 47
 agent-relay-ctl grant web --for 1h     # approve a project in advance (or --all)
 agent-relay-ctl revoke web             # running requests finish; --stop ends them
 agent-relay-ctl watch                  # events as they come
+agent-relay-ctl actions                # host actions waiting for an answer
+agent-relay-ctl deny-action 52
 ```
 
 - **Grants** cover one project or all projects with a dev container, and end
@@ -79,6 +83,22 @@ agent-relay-ctl watch                  # events as they come
   Claude Code started by the relay cannot approve anything. Grants are kept in
   `~/.local/state/agent-relay-mcp/access.json`; an unreadable file locks
   everything.
+
+### Host actions
+
+Host actions are fixed commands you list in `config.toml` under
+`[actions.<name>]` (see `config.example.toml`), such as a deploy that has to
+run on the computer itself, outside the dev container. The client can only
+ask for one with `request_host_action`, for a project the action is set up
+for; it cannot add arguments. A host action is not a message to Claude Code:
+it does not start, join or keep open the project's conversation, and it does
+not count as work (keep-awake, grant idle time). A request waits with a two-digit number (never
+the same as a waiting approval request), at most one per project, and expires
+after `request_expiry_minutes`. `agent-relay-ctl actions` shows the exact
+command line and Claude's note; `deny-action` denies it. So far that is all:
+running an approved action comes in a later step (see
+`docs/host-actions-plan.md`), and nothing is run yet. The GNOME extension does
+not show host actions yet.
 
 ### The GNOME extension
 

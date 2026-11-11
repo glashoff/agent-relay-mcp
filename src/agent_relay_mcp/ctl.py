@@ -1,9 +1,11 @@
 """agent-relay-ctl: approvals for the relay from a terminal, over D-Bus.
 
-    agent-relay-ctl                       state: grants, requests, projects
+    agent-relay-ctl                       state: grants, requests, host actions, projects
     agent-relay-ctl grant web --for 2h    approve a project (or --all)
     agent-relay-ctl approve 47            approve the request with number 47
     agent-relay-ctl deny 47
+    agent-relay-ctl actions               host actions waiting for an answer
+    agent-relay-ctl deny-action 52        deny the host action with number 52
     agent-relay-ctl revoke web [--stop]   end a grant (or --all)
     agent-relay-ctl stop web [--lock]     stop what runs there (and end its grants)
     agent-relay-ctl keep-awake running    off, running or granted; --lid too
@@ -19,6 +21,7 @@ import argparse
 import asyncio
 import json
 import re
+import shlex
 import sys
 import time
 
@@ -130,6 +133,9 @@ def show_state(state: dict) -> None:
         for message in r["messages"]:
             text = " ".join(message.split())
             print(f"      > {text[:300]}{'…' if len(text) > 300 else ''}")
+    if state.get("host_actions"):
+        print()
+        show_actions(state)
     for s in state["switches"]:
         where_to = "on the host" if s["kind"] == "host" else "in the dev container"
         print(f"\nSwitch waiting: {s['project']} to run {where_to} once idle "
@@ -148,6 +154,23 @@ def show_state(state: dict) -> None:
             ", open for follow-ups" if p.get("open") else ""
         container = "" if p["dev_container"] else "  [no dev container]"
         print(f"  {p['name']}: {status}{busy}{container}")
+
+
+def show_actions(state: dict) -> None:
+    now = time.time()
+    actions = state.get("host_actions", [])
+    print("Host actions waiting:" if actions else "Host actions waiting: none.")
+    for a in actions:
+        print(f"  number {a['number']}  {a['action']} for {a['project']}, "
+              f"{until(now - a['created'])} ago, expires in {until(a['expires'] - now)}")
+        if a["description"]:
+            print(f"      {a['description']}")
+        print(f"      runs: {shlex.join(a['command'])}")
+        if a["writable"]:
+            print(f"      WARNING: {state['warnings']['writable_action']}")
+        if a["note"]:
+            text = " ".join(a["note"].split())
+            print(f"      note from Claude > {text[:300]}{'…' if len(text) > 300 else ''}")
 
 
 def describe_grant(result: dict) -> str:
@@ -169,6 +192,14 @@ async def find_request(client: Client, which: str) -> dict:
         if which in (r["id"], str(r["number"])):
             return r
     raise Failure(f"No open request {which!r}.")
+
+
+async def find_action(client: Client, which: str) -> dict:
+    state = await client.state()
+    for a in state.get("host_actions", []):
+        if which in (a["id"], str(a["number"])):
+            return a
+    raise Failure(f"No waiting host action {which!r}.")
 
 
 async def find_grant(client: Client, which: str) -> str:
@@ -252,6 +283,15 @@ async def command(args, client: Client) -> None:
         request = await find_request(client, args.request)
         await client.call("Deny", "s", [request["id"]])
         print(f"Denied number {request['number']} for {request['project']}.")
+        return
+    if args.command == "actions":
+        show_actions(await client.state())
+        return
+    if args.command == "deny-action":
+        action = await find_action(client, args.action)
+        await client.call("DenyAction", "s", [action["id"]])
+        print(f"Denied host action {action['action']} (number {action['number']}) for "
+              f"{action['project']}; nothing was run.")
         return
     if args.command == "revoke":
         if args.all:
@@ -349,6 +389,10 @@ def parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("deny", help="deny a waiting request")
     d.add_argument("request", help="its number (or id)")
+
+    sub.add_parser("actions", help="host actions waiting for an answer")
+    da = sub.add_parser("deny-action", help="deny a waiting host action")
+    da.add_argument("action", help="its number (or id)")
 
     r = sub.add_parser("revoke", help="end a grant; running requests finish unless --stop")
     r.add_argument("grant", nargs="?", help="grant id or project")

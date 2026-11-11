@@ -63,6 +63,10 @@ class Control:
     async def deny(self, request_id: str) -> None:
         await self._call(self.relay.deny(request_id))
 
+    async def deny_action(self, action_id: str) -> None:
+        """Denies a waiting host action; nothing is run."""
+        await self._call(self.relay.deny_action(action_id))
+
     async def revoke(self, grant_id: str, stop: bool = False) -> dict:
         return await self._call(self.relay.revoke(grant_id, stop))
 

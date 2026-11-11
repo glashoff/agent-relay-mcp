@@ -8,6 +8,9 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import host_actions
+from .host_actions import Action
+
 DEFAULT_CONFIG_FILE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") \
     / "agent-relay-mcp/config.toml"
 DEFAULT_STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") \
@@ -106,6 +109,11 @@ class Config:
     mcp_socket: str = DEFAULT_MCP_SOCKET
     events_socket: str = DEFAULT_EVENTS_SOCKET
 
+    # What Claude may ask to have run on this computer, outside any dev
+    # container: the [actions.<name>] tables (see host_actions.py). None
+    # without them.
+    actions: dict[str, Action] = field(default_factory=dict)
+
 
 def load(path: Path | None = None) -> Config:
     path = path or DEFAULT_CONFIG_FILE
@@ -123,7 +131,9 @@ def load(path: Path | None = None) -> Config:
         raise SystemExit(f"{path}: unknown keys: {', '.join(sorted(unknown))}")
     for key, value in raw.items():
         default = getattr(config, key)
-        if isinstance(default, Path):
+        if key == "actions":
+            value = host_actions.parse(value, str(path))
+        elif isinstance(default, Path):
             value = Path(value).expanduser()
         elif isinstance(default, bool):
             if not isinstance(value, bool):
@@ -156,6 +166,8 @@ def load(path: Path | None = None) -> Config:
             raise SystemExit(f"{path}: {key} must be at least 1")
     if config.conversation_idle_minutes < 0:
         raise SystemExit(f"{path}: conversation_idle_minutes must be 0 or more")
+    # Only now is projects_dir final.
+    host_actions.check_writable(config.actions, config.projects_dir, str(path))
     return config
 
 

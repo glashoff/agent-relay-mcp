@@ -1,4 +1,4 @@
-"""The MCP endpoint: five tools over Streamable HTTP, on a Unix socket only."""
+"""The MCP endpoint: seven tools over Streamable HTTP, on a Unix socket only."""
 
 
 import argparse
@@ -63,6 +63,13 @@ How to use it:
 - When the user says they are done with a project (or with everything), end
   the approval with release_access. If Claude Code is still working there,
   tell the user and ask whether to wait or to stop it first.
+- Host actions are fixed commands the user has set up to run on the computer
+  itself, outside the dev container (such as a deploy). Ask for one with
+  request_host_action only when the user explicitly wants it. It only asks:
+  the user approves this one run at the laptop, and nothing runs before.
+  Tell the user the number from the reply; get_host_action gives its state.
+  A host action is not a message to Claude Code and does not touch its
+  conversation. Never try to work around a denied or waiting host action.
 """
 
 ProjectName = Annotated[str, Field(description="Project name as listed by list_projects.")]
@@ -180,6 +187,29 @@ def build(config: config_module.Config) -> tuple[MCPServer, Relay]:
             "End every approval, for all projects."))] = False,
     ) -> str:
         return await guarded(relay.release_access(project, all_projects))
+
+    @server.tool(description=(
+        "Only on the user's explicit request: asks to run a host action, a fixed command "
+        "the user has set up for a project (such as a deploy), on the computer itself, "
+        "outside the dev container. This only asks: the user approves this one run at "
+        "the laptop, and nothing runs before. The reply gives a number; tell it to the "
+        "user. Unknown actions are refused, naming the ones there are."))
+    async def request_host_action(
+        project: ProjectName,
+        action: Annotated[str, Field(description="The name of the host action, e.g. deploy.")],
+        note: Annotated[str, Field(description=(
+            "A short note for the user, shown with the request at the laptop: why it "
+            "is needed now."))] = "",
+    ) -> str:
+        return await guarded(relay.request_host_action(project, action, note))
+
+    @server.tool(description=(
+        "Gets the state of a host action asked for with request_host_action, by its "
+        "number: waiting for approval, denied, or expired."))
+    async def get_host_action(
+        number: Annotated[int, Field(description="The number from request_host_action.")],
+    ) -> str:
+        return await guarded(relay.get_host_action(number))
 
     return server, relay
 

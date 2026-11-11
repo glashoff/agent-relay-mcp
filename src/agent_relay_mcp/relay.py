@@ -45,6 +45,7 @@ from .access import (ALL, CONTAINER, HOST, HOST_WARNING, ON_HOST_WARNING, Access
                      AccessError, Grant, Limits, Switch)
 from .config import Config
 from .events import TurnOutput, complete_lines
+from .host_actions import WRITABLE_WARNING, HostActions
 from . import project_log
 from .keep_awake import KeepAwake
 from .project_log import ProjectLog
@@ -246,6 +247,8 @@ class Relay:
             max_project=config.max_grant_hours * 3600,
             max_all=config.max_all_grant_hours * 3600,
             max_host=config.max_host_grant_hours * 3600))
+        self.host_actions = HostActions(config.state_dir / "host_actions.json",
+                                        expiry=config.request_expiry_minutes * 60)
         self.keep_awake = KeepAwake(config.state_dir / "keep_awake.json",
                                     command=config.keep_awake_command)
         self._load()
@@ -808,6 +811,9 @@ kill -KILL -- "-$p" 2>/dev/null || true
                 where += "; Claude Code is open for follow-ups"
             if conversation and conversation.queue:
                 where += f"; {len(conversation.queue)} message(s) queued"
+            action = self.host_actions.waiting_for(project.name)
+            if action:
+                where += f"; host action {action.action} waiting (number {action.number})"
             lines.append(f"- {project.name} ({where}; {self._access_note(project, now)})")
         if not lines:
             return "No usable projects found."
@@ -910,7 +916,8 @@ kill -KILL -- "-$p" 2>/dev/null || true
         try:
             request, new = self.access.request(
                 project.name, messages, now, kind=kind,
-                full_access=kind == HOST or not project.has_devcontainer)
+                full_access=kind == HOST or not project.has_devcontainer,
+                taken=self.host_actions.numbers())
         except AccessError as error:
             raise RelayError(str(error)) from error
         self.access.save()
@@ -1331,6 +1338,14 @@ kill -KILL -- "-$p" 2>/dev/null || true
     async def get_updates(self, project_name: str, wait_seconds: int) -> str:
         project = targets.find_project(self.config, project_name)
         self._background()
+        report = await self._updates(project, wait_seconds)
+        action = self.host_actions.waiting_for(project.name)
+        if action:
+            report = (f"The host action {action.action} for {project.name} is waiting for "
+                      f"an answer at the laptop (number {action.number}).\n\n{report}")
+        return report
+
+    async def _updates(self, project: Project, wait_seconds: int) -> str:
         async with self._lock(project.name):
             now = self.clock()
             current = self._current(project)
@@ -1690,6 +1705,75 @@ kill -KILL -- "-$p" 2>/dev/null || true
             self._emit("grant_ended", grant=grant.id, reason="screen locked", stopped=False)
             await self._after_grant_end(grant, False)
 
+    # --- host actions ---------------------------------------------------------------
+    # Claude can only ask; so far a request can only be denied or expire, and
+    # nothing is ever run (see docs/host-actions-plan.md).
+
+    async def request_host_action(self, project_name: str, action_name: str,
+                                  note: str = "") -> str:
+        project = targets.find_project(self.config, project_name)
+        allowed = [a for a in self.config.actions.values() if a.applies_to(project.name)]
+        names = ", ".join(a.name for a in allowed)
+        action = next((a for a in allowed
+                       if a.name.casefold() == action_name.strip().casefold()), None)
+        if action is None:
+            if not allowed:
+                raise RelayError(f"No host actions are configured for {project.name}.")
+            raise RelayError(f"There is no host action {action_name!r} for {project.name}. "
+                             f"Host actions for it: {names}.")
+        if action.writable_by_host_runs and project.has_devcontainer:
+            raise RelayError(f"The host action {action.name} runs a command that the "
+                             f"project can change, and {project.name} now has a dev "
+                             "container; it is refused until the configuration is changed.")
+        self._background()
+        now = self.clock()
+        try:
+            request = self.host_actions.request(
+                project.name, action, action.resolve(project.path), note.strip(), now,
+                taken={r.number for r in self.access.requests.values()})
+        except AccessError as error:
+            raise RelayError(str(error)) from error
+        self.host_actions.save()
+        self._emit("host_action_requested", id=request.id, number=request.number,
+                   project=project.name, action=action.name)
+        log.info("%s: host action %s waits for an answer (number %d)", project.name,
+                 action.name, request.number)
+        self._log_note(project.name, f"Host action {action.name} requested (number "
+                                     f"{request.number}); it waits for an answer at the "
+                                     "laptop.")
+        suspended = (" Note: it cannot be answered at the moment, because the relay has "
+                     "lost its connection to the desktop session; that works again once "
+                     "it is back.") if self.access.suspended else ""
+        return (f"The host action {action.name} for {project.name} is waiting for approval "
+                f"at the laptop: number {request.number}. Tell the user this number, so "
+                "they can match it there. Nothing runs before it is approved, and an "
+                "approval is for this one run only. Ask for its state with get_host_action. "
+                f"The request expires in {_duration(request.expires - now)} if nobody "
+                f"answers it.{suspended}")
+
+    async def get_host_action(self, number: int) -> str:
+        request = self.host_actions.by_number(number)
+        if request is None:
+            raise RelayError(f"There is no host action with number {number}.")
+        now = self.clock()
+        what = f"The host action {request.action} for {request.project} (number {number})"
+        if request.status == "denied":
+            return f"{what} was denied at the laptop; nothing was run."
+        if request.status == "expired":
+            return f"{what} expired without an answer; nothing was run."
+        return (f"{what} is waiting for approval at the laptop "
+                f"({_duration(now - request.created)} so far; it expires in "
+                f"{_duration(request.expires - now)}). Nothing has run.")
+
+    async def deny_action(self, request_id: str) -> None:
+        request = self.host_actions.deny(request_id, self.clock())
+        self.host_actions.save()
+        self._log_note(request.project, f"Host action {request.action} (number "
+                                        f"{request.number}) was denied at the laptop; "
+                                        "nothing was run.")
+        self._emit("host_action_answered", id=request.id, project=request.project,
+                   number=request.number, status="denied")
+
     # --- the sweeper ------------------------------------------------------------
 
     async def _sweep_forever(self) -> None:
@@ -1727,6 +1811,13 @@ kill -KILL -- "-$p" 2>/dev/null || true
             self._log_note(request.project, f"Request {request.number} expired without an "
                                             "answer; nothing was run.")
             self._emit("request_expired", request=request.id, project=request.project)
+        for action in self.host_actions.expired(now):
+            self.host_actions.save()
+            self._log_note(action.project, f"Host action {action.action} (number "
+                                           f"{action.number}) expired without an answer; "
+                                           "nothing was run.")
+            self._emit("host_action_expired", id=action.id, project=action.project,
+                       number=action.number)
         for name, switch in list(self.access.switches.items()):
             project = projects.get(name)
             if project:
@@ -1874,7 +1965,14 @@ kill -KILL -- "-$p" 2>/dev/null || true
             "switches": [{"project": s.project, "kind": s.kind, "requested": s.requested,
                           "expires": s.expires, "held": len(s.held)}
                          for s in self.access.switches.values()],
-            "warnings": {"host_project": HOST_WARNING, "on_host": ON_HOST_WARNING},
+            "host_actions": [{"id": a.id, "number": a.number, "project": a.project,
+                              "action": a.action, "description": a.description,
+                              "command": a.command, "note": a.note[:2000],
+                              "writable": a.writable, "created": a.created,
+                              "expires": a.expires}
+                             for a in self.host_actions.waiting()],
+            "warnings": {"host_project": HOST_WARNING, "on_host": ON_HOST_WARNING,
+                         "writable_action": WRITABLE_WARNING},
         }
 
     # --- reporting ------------------------------------------------------------

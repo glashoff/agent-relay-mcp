@@ -6,8 +6,8 @@ Methods take and return small JSON strings; events are the signal Event. The
 relay also listens to org.gnome.ScreenSaver, so grants that end on screen lock
 end even while the extension is switched off by the lock screen.
 
-Anything that only makes things safer (state, deny, revoke, cancelling a
-switch) is accepted from any caller of this user. Grant and Approve are only
+Anything that only makes things safer (state, deny, denying a host action,
+revoke, cancelling a switch) is accepted from any caller of this user. Grant and Approve are only
 accepted from GNOME Shell or from a process with a terminal: Claude Code
 started by the relay has none. That is a hurdle, not a wall: a process of this
 user can always find a way (see docs/access-control-plan.md, section 8).
@@ -51,6 +51,7 @@ INTROSPECTION = f"""<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Intr
       <arg direction="out" type="s" name="result"/>
     </method>
     <method name="Deny"><arg direction="in" type="s" name="request"/></method>
+    <method name="DenyAction"><arg direction="in" type="s" name="action"/></method>
     <method name="Revoke">
       <arg direction="in" type="s" name="grant"/>
       <arg direction="in" type="b" name="stop"/>
@@ -85,6 +86,7 @@ METHODS = {
     "Grant": ("s", "s", True),
     "Approve": ("s", "s", True),
     "Deny": ("s", "", False),
+    "DenyAction": ("s", "", False),
     "Revoke": ("sb", "s", False),
     "RevokeAll": ("b", "u", False),
     "CancelSwitch": ("s", "", False),
@@ -312,6 +314,9 @@ class DBusControl:
             return json.dumps(await c.approve(request, **options))
         if member == "Deny":
             await c.deny(body[0])
+            return None
+        if member == "DenyAction":
+            await c.deny_action(body[0])
             return None
         if member == "Revoke":
             return json.dumps(await c.revoke(body[0], body[1]))

@@ -241,9 +241,12 @@ class Access:
     # --- requests ------------------------------------------------------------
 
     def request(self, project: str, messages: list[str], now: float, *,
-                full_access: bool, kind: str = "") -> tuple[Request, bool]:
+                full_access: bool, kind: str = "",
+                taken: set[int] = frozenset()) -> tuple[Request, bool]:
         """The open request of project with messages added: (request, whether it
-        is new). kind: where the chat asks it to run (see Request.kind)."""
+        is new). kind: where the chat asks it to run (see Request.kind). taken:
+        numbers in use elsewhere (waiting host actions), never given to a new
+        request."""
         for r in self.requests.values():
             if r.project == project:
                 if r.kind != kind:
@@ -259,7 +262,7 @@ class Access:
         if len(self.requests) >= self.limits.max_open_requests:
             raise AccessError("Too many requests are already waiting for approval at "
                               "the laptop; try again later.")
-        taken = {r.number for r in self.requests.values()}
+        taken = set(taken) | {r.number for r in self.requests.values()}
         number = random.choice([n for n in range(10, 100) if n not in taken])
         r = Request(id=uuid.uuid4().hex[:12], project=project, number=number,
                     messages=list(messages), created=now,

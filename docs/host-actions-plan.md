@@ -1,6 +1,9 @@
 # Host actions for agent-relay-mcp: plan
 
-Status: final plan, decided 2026-11-10. Not built yet.
+Status: final plan, decided 2026-11-10. Step 1 (section 9) is built:
+asking for host actions and denying them; nothing runs yet. A host action
+is separate from Claude Code's conversation (docs/conversation-plan.md): it
+neither starts, joins nor keeps open a run, and it does not count as work.
 
 Host actions let Claude ask for something to be run on the laptop itself,
 outside any dev container: fixed actions per project (deploy, approve,
