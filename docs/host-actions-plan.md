@@ -52,7 +52,7 @@ window and have a `--pause` option.
   with fixed arguments (placeholder `{project}` for the project folder) and
   the files that must be mounted read-only.
   ```toml
-  # ... existing settings (projects_dir, public_hosts, ...) ...
+  # ... existing settings (projects_dir, mcp_socket, ...) ...
 
   [actions.deploy]
   description = "Deploy from the host"

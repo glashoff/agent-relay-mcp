@@ -9,9 +9,11 @@ the connector URL) can make Claude Code work in any project. This plan adds
 approvals: projects are locked by default, and nothing runs without an
 approval given by the owner in a way that the Claude account cannot reach.
 
-Scope: the laptop. The server instance on the V-server is deferred and kept
-in [server-instance-plan.md](server-instance-plan.md); the core is built so
-that it can run there later without GNOME.
+Scope: the laptop. The server instance on the V-server and the path from
+the Claude app through the V-server were removed on 2026-11-11: the relay is
+now reached only through its Unix sockets on the laptop (README, "Reaching
+it"). What this plan says about the V-server and the connector URL is kept
+as the reasoning of the time.
 
 ## 1. Decisions taken
 
@@ -22,11 +24,11 @@ that it can run there later without GNOME.
    V-server serves: a compromised V-server must not be able to approve
    anything on the laptop.
 2. **Phone approval for the laptop comes later**, through a channel the
-   V-server cannot forge. The options are compared in
-   [phone-approval-for-the-laptop.md](phone-approval-for-the-laptop.md).
-3. **The relay core runs without GNOME**, so the same program can later run
-   on the V-server as a second instance. Everything that enforces is in the
-   core; GNOME and D-Bus are optional parts on top.
+   V-server cannot forge. (Dropped on 2026-11-11 together with the V-server
+   path; its comparison of options was deleted.)
+3. **The relay core runs without GNOME**, so the same program could run on
+   the V-server as a second instance (dropped on 2026-11-11). Everything that
+   enforces is in the core; GNOME and D-Bus are optional parts on top.
 4. **Host projects stay allowed on the laptop** (projects without a dev
    container, `allow_host_projects = true`). They are locked by default and
    approved the same way as other projects, but every place that shows or
@@ -82,7 +84,7 @@ that it can run there later without GNOME.
 | Someone with access to the Claude account | Call every tool of every connector: send messages to any project | Can only create requests; cannot approve one, on any instance |
 | Claude Code in a dev container (or text it reads: prompt injection) | Change the project's files, run commands in the container, upload with whatever credentials the container holds | Cannot approve; cannot reach the control interface |
 | Claude Code in a project on the laptop host (no container) | Everything the user can do | Cannot be contained (same user). Runs only under an explicit grant, given with a clear warning (section 4, "Host projects") |
-| A compromised V-server | Read and send MCP traffic to the laptop relay (TLS ends on the server, the tunnel starts there) | Can only create requests on the laptop, like the Claude account; cannot approve |
+| A compromised V-server | Read and send MCP traffic to the laptop relay (TLS ends on the server, the tunnel starts there) | Can only create requests on the laptop, like the Claude account; cannot approve. Since 2026-11-11 there is no such path: the relay has no TCP listener, only Unix sockets on the laptop |
 
 ## 3. Architecture
 
@@ -374,7 +376,8 @@ and then walking away, and the screen locks a few minutes later. Instead:
   reviewed git state (`pipx install` of a tag, the extension copied), not
   editable from the project folder Claude works in.
 - **The connector URL stays secret** as before; approvals add to it, they do
-  not replace it.
+  not replace it. (Since 2026-11-11 there is no URL: only the Unix sockets,
+  mode 600, reach the relay.)
 - **Containers** reach neither the session bus nor the relay's port (checked on the laptop for fkirchhoff.com: no bus or Docker
   socket mounted).
 - **Requests**: rate limits, one open request per project, foreign text shown
@@ -401,9 +404,8 @@ and then walking away, and the screen locks a few minutes later. Instead:
    activating it needs one log out and in.
 6. **GNOME extension: notifications**, including the summary after
    unlocking.
-7. **Later**: the server instance ([server-instance-plan.md](server-instance-plan.md))
-   and phone approval for the laptop
-   ([phone-approval-for-the-laptop.md](phone-approval-for-the-laptop.md)).
+7. **Later**: the server instance and phone approval for the laptop. Both
+   dropped on 2026-11-11, with the V-server path; their plans were deleted.
 
 ## 10. Open questions
 

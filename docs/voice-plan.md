@@ -200,7 +200,8 @@ be built in parallel.
 - `mcp_socket`, default for the voice setup
   `$XDG_RUNTIME_DIR/agent-relay/mcp.sock`: the same MCP app as the TCP
   endpoint (same Host and Origin checks; the forwarder in the container sends
-  `Host: localhost:8765`).
+  `Host: localhost:8765`). Since 2026-11-11 it is the only endpoint: the TCP
+  listener was removed, and both sockets are on by default.
 - `events_socket`, default `$XDG_RUNTIME_DIR/agent-relay/events.sock`: every
   client gets each control event as one JSON object per line, exactly the
   JSON the D-Bus `Event` signal carries (`{"type": "run_ended", ...}`). The

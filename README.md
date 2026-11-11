@@ -1,24 +1,24 @@
 # agent-relay-mcp
 
-An MCP server that lets a Claude chat hand tasks to **Claude Code on your own
-computer**, in the dev container of one of your projects, and report back.
+An MCP server that lets an assistant on your computer hand tasks to **Claude
+Code**, in the dev container of one of your projects, and report back.
 
-It is made for the Claude mobile app's hands-free voice mode: you talk to
-Claude on your phone, it passes your request on to Claude Code working in
-your project at home, and later reads you a short summary of what came out.
-It works the same from any Claude chat that supports custom connectors.
+It is made for the local voice service (`voice/`): you talk to it at the
+laptop, it passes your request on to Claude Code working in your project, and
+later tells you in a few words what came out. The relay is reached only
+through Unix sockets on this machine; it has no network port.
 
 ```
-phone (Claude app) ── Anthropic ──HTTPS──> your reverse proxy /<secret>/mcp
-                                                  │  (tunnel, if the computer is behind NAT)
+voice service (container) ── socat ──> $XDG_RUNTIME_DIR/agent-relay/mcp.sock
+                                                  │
                                                   ▼
-                                   agent-relay-mcp on your computer (127.0.0.1:8765)
+                                   agent-relay-mcp on your computer
                                                   │  docker exec
                                                   ▼
                                    claude -p … in the project's dev container
 ```
 
-## What the chat gets
+## What the client gets
 
 Five tools:
 
@@ -30,18 +30,19 @@ Five tools:
 | `stop(project)` | Ends the current request (or Claude Code waiting for the next message); the conversation is kept |
 | `release_access(project="", all_projects=false)` | Ends your approval for a project (or all) when you say you are done, so it is locked again; refused while Claude Code still works there. It can only take access away |
 
-Requests to a coding agent take minutes, but Claude's apps give up on a tool
-call after somewhere between 20 and 60 seconds. So nothing here waits by
-default: the chat says "Claude Code is working on it", and you ask later. The
-optional `wait_seconds` (at most 15 by default) is for questions that are
-obviously quick.
+Requests to a coding agent take minutes, but an assistant should not hang on
+a tool call that long. So nothing here waits by default: the assistant says
+"Claude Code is working on it", and you ask later (the voice service also
+announces finished requests from the event socket). The optional
+`wait_seconds` (at most 15 by default) is for questions that are obviously
+quick.
 
 ## Approvals
 
 Every project is locked. A message to a locked project does not run; it
-becomes a request with a two-digit number, which the chat tells you. You
+becomes a request with a two-digit number, which the assistant tells you. You
 approve it at the computer, and the message then runs by itself. Nothing the
-chat or Claude Code can call gives approvals: they come only through the
+assistant or Claude Code can call gives approvals: they come only through the
 control interface on the D-Bus session bus, used by the GNOME extension
 (below) and by `agent-relay-ctl`:
 
@@ -64,7 +65,7 @@ agent-relay-ctl watch                  # events as they come
   grants need you to type "full access". A project changes between its dev
   container and the host only while the other side is idle (`--when-idle`
   waits for that).
-- **Asking for the host**: the chat can ask to run a project with a dev
+- **Asking for the host**: the assistant can ask to run a project with a dev
   container on the host (`send_message(..., run_on_host=true)`). That only
   makes a request shown as "asks to run ON THE HOST"; nothing runs on the
   host until you approve it with "full access" (or approve it for the dev
@@ -127,7 +128,7 @@ off, or while anything is approved; and optionally also with the lid closed
 ### Following along
 
 The relay writes a readable log of each project's conversation into the
-project folder, `.relay/log.md`: what the chat sent (and messages passed in or
+project folder, `.relay/log.md`: what the assistant sent (and messages passed in or
 queued, requests waiting for approval), Claude Code's steps, what it says in
 between, its thinking as short summaries, and the replies. It reads the
 output every two seconds while a request runs, so the log is current without
@@ -180,8 +181,8 @@ its own, also when it goes into a Claude Code that is still open. Open the file 
   coreutils).
 - **Runs are detached.** A run is started with `setsid` inside the container
   and writes to files under `~/.cache/agent-relay-mcp/<run>/` there. Restarting
-  this server, a dropped tunnel or a phone that never asks again does not stop
-  it, and it stays open: the restarted server finds it again from the ids it
+  this server or a client that never asks again does not stop it, and it
+  stays open: the restarted server finds it again from the ids it
   keeps (in `~/.local/state/agent-relay-mcp/`), passes the next message into
   it and reads the output again. Run directories untouched for 7 days are
   removed. A run on this machine (a project without a dev container, or one
@@ -207,8 +208,8 @@ its own, also when it goes into a Claude Code that is still open. Open the file 
   from `claude setup-token` in the `CLAUDE_CODE_OAUTH_TOKEN` environment
   variable is enough and is the smaller credential: it can make model requests
   and nothing else.
-- A Claude plan with custom connectors, and a public HTTPS endpoint for this
-  server (next section).
+- A client on this machine that speaks MCP over the Unix socket (next
+  section), such as the voice service.
 
 ## Install
 
@@ -230,7 +231,7 @@ pipx install 'agent-relay-mcp[desktop] @ git+https://github.com/glashoff/agent-r
 # [desktop] adds dbus-fast, needed for approvals; agent-relay-ctl comes with it
 mkdir -p ~/.config/agent-relay-mcp
 cp config.example.toml ~/.config/agent-relay-mcp/config.toml
-$EDITOR ~/.config/agent-relay-mcp/config.toml               # public_hosts at least
+$EDITOR ~/.config/agent-relay-mcp/config.toml               # projects_dir at least
 
 cp contrib/agent-relay-mcp.service ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -240,63 +241,35 @@ systemctl --user enable --now agent-relay-mcp
 Without a long-lived login session, a user service stops at logout; run
 `loginctl enable-linger $USER` to keep it running.
 
-## Exposing it
+## Reaching it
 
-Claude's servers, not your phone, call the connector, so the endpoint has to
-be reachable from the internet over HTTPS. The server itself only listens on
-loopback and speaks plain HTTP; put something in front of it:
-
-1. **A reverse proxy on a machine with a public address** that forwards one
-   secret path and nothing else. With Caddy:
-
-   ```caddy
-   example.org {
-       handle_path /<long random string>/* {
-           reverse_proxy 127.0.0.1:8765
-       }
-   }
-   ```
-
-   Generate the secret with `python3 -c 'import secrets; print(secrets.token_urlsafe(24))'`.
-   `handle_path` strips it, so the server sees `/mcp`. Keep this path out of
-   the proxy's access log.
-
-2. **A tunnel** from your computer to that machine, when the computer is
-   behind NAT. `contrib/agent-relay-tunnel.service` is an SSH reverse tunnel
-   that restarts itself and starts and stops with the server; its comments
-   show how to restrict the key on the server side. Tailscale Funnel or a Cloudflare Tunnel do the same job.
-
-3. Set `public_hosts` to the proxy's host name. The server refuses requests
-   with any other `Host` header.
-
-Then add a custom connector in Claude (Settings → Connectors) with the URL
-`https://example.org/<secret>/mcp` and no authentication. Adding it reports
-that it "couldn't determine how this server signs in"; that is expected,
-choose *Continue anyway*.
-
-### Unix sockets
-
-For clients on this machine that should not need the TCP port (the voice
-service runs in a container without a path to the host's loopback), the relay
-can serve the same endpoint on a Unix socket as well, and its events on a
-second one:
+The relay listens only on Unix sockets, by default:
 
 ```toml
 mcp_socket = "$XDG_RUNTIME_DIR/agent-relay/mcp.sock"
 events_socket = "$XDG_RUNTIME_DIR/agent-relay/events.sock"
 ```
 
-- `mcp_socket` is the MCP endpoint, with the same tools and the same `Host`
-  and `Origin` checks (send `Host: localhost:8765`); the TCP port stays.
-- `events_socket` sends every event of the control interface (run started or
-  ended, request added, grant ended …) as one JSON object per line, exactly
-  what the D-Bus signal `Event` carries. It reads nothing: no commands, so
-  nothing can be approved through it. A client that does not keep up is
-  dropped. It does not need D-Bus.
-- Both are off unless set. The directory is created with mode 700, the
-  sockets with mode 600, so only your user can connect; mount the directory
-  into a container to pass them on. A socket left over from a crash is
-  replaced; one another relay is listening on stops the start.
+- `mcp_socket` is the MCP endpoint (Streamable HTTP at `/mcp`); it is
+  required. Clients send a local `Host` header (`localhost` or `127.0.0.1`,
+  with or without a port; the voice container's forwarder sends
+  `localhost:8765`); any other `Host`, or a foreign `Origin`, is refused. A
+  client that only speaks HTTP over TCP needs a forwarder, e.g.
+  `socat TCP-LISTEN:8765,bind=127.0.0.1,fork UNIX-CONNECT:<mcp_socket>`, as
+  the voice container runs one.
+- `events_socket` sends every event of the control interface (request
+  started or ended, request added, grant ended …) as one JSON object per
+  line, exactly what the D-Bus signal `Event` carries. It reads nothing: no
+  commands, so nothing can be approved through it. A client that does not
+  keep up is dropped. It does not need D-Bus. Empty turns it off.
+- The directory is created with mode 700, the sockets with mode 600, so only
+  your user can connect; mount the directory into a container to pass them
+  on. A socket left over from a crash is replaced; one another relay is
+  listening on stops the start.
+- There is no TCP listener any more (until 2026-11-11 there was one, for a
+  reverse proxy on a server, so that the Claude app could reach the relay
+  from the internet). `listen_host`, `listen_port` and `public_hosts` in an
+  old configuration are ignored with a warning.
 
 ### Voice on the laptop (optional)
 
@@ -313,14 +286,12 @@ extension's Voice menu. Details in `voice/README.md`, the design in
 
 ## Security
 
-Read this before exposing it.
-
-- **The URL lets anyone ask.** There is no sign-in: whoever knows the URL can
-  send requests, which then wait for your approval (section "Approvals"), and
-  can use whatever you have approved while the grant lasts. Treat the URL
-  like a password, keep it out of logs, and change it (in the proxy and the
-  connector) if it may have leaked. OAuth would add a real sign-in at the cost
-  of running an authorization server; it is not implemented.
+- **Who can ask.** Only processes of your user on this machine can connect
+  to the sockets (mode 600 in a directory with mode 700), and whatever you
+  mount the directory into (the voice container). There is no sign-in beyond
+  that: a client can send requests, which then wait for your approval
+  (section "Approvals"), and can use whatever you have approved while the
+  grant lasts. Nothing reachable through the sockets can approve.
 - **Approvals are as strong as this user account.** Claude Code in a project
   without a dev container (or one approved to run on the host) runs as you
   and could change the relay, its grants or its code. Grant full access only
@@ -337,8 +308,8 @@ Read this before exposing it.
 - **This server can run Docker**, which is as good as root on most machines.
   It runs only `docker ps/inspect/exec` and your `start_command`, and it never
   runs a command it received; requests reach Claude Code only as its prompt.
-- **Usage.** Every request is a Claude Code run on your plan, on top of the
-  chat that sent it.
+- **Usage.** Every request is Claude Code working on your plan, on top of the
+  assistant that sent it.
 
 ## Development
 
